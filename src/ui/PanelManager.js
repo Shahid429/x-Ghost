@@ -39,6 +39,14 @@ window.PanelManager = function (
     pendingImportCount: null,
     isSplashDragging: false,
     splashPosition: { top: null, left: null },
+    autoDeleteStatus: {
+      running: false,
+      deleting: false,
+      deletedCount: 0,
+      username: null,
+      canRun: false,
+      message: "Open your /with_replies page to enable auto delete.",
+    },
   };
   this.log(`PanelManager initialized with themeMode: ${this.state.themeMode}`);
   this.uiElements = {
@@ -312,6 +320,19 @@ window.PanelManager.prototype.init = function () {
     this.log(`Exported CSV: processed_posts.csv`);
   };
 
+  const handleAutoDeleteStatus = (e) => {
+    const detail = e.detail || {};
+    this.state.autoDeleteStatus = {
+      running: Boolean(detail.running),
+      deleting: Boolean(detail.deleting),
+      deletedCount: detail.deletedCount ?? 0,
+      username: detail.username || null,
+      canRun: Boolean(detail.canRun),
+      message: detail.message || "",
+    };
+    this.renderPanelDebounced();
+  };
+
   this.document.addEventListener(
     EVENTS.INIT_COMPONENTS,
     ({ detail: { config } }) => {
@@ -352,6 +373,10 @@ window.PanelManager.prototype.init = function () {
     handleMetricsRetrieved
   );
   this.document.addEventListener(EVENTS.CSV_EXPORTED, handleCsvExported);
+  this.document.addEventListener(
+    EVENTS.AUTO_DELETE_STATUS,
+    handleAutoDeleteStatus
+  );
   this.cleanup = () => {
     this.document.removeEventListener(EVENTS.STATE_UPDATED, handleStateUpdated);
     this.document.removeEventListener(
@@ -395,6 +420,10 @@ window.PanelManager.prototype.init = function () {
       handleMetricsRetrieved
     );
     this.document.removeEventListener(EVENTS.CSV_EXPORTED, handleCsvExported);
+    this.document.removeEventListener(
+      EVENTS.AUTO_DELETE_STATUS,
+      handleAutoDeleteStatus
+    );
   };
   this.renderPanelDebounced = this.debounce(() => this.renderPanel(), 500);
   if (window.preact && window.preact.h) {
@@ -619,6 +648,8 @@ window.PanelManager.prototype.renderPanel = function () {
       onClearPosts: () => this.clearPosts(),
       onOpenAbout: () => this.openAbout(),
       onToggleDropdown: () => this.toggleDropdown(),
+      autoDeleteStatus: this.state.autoDeleteStatus,
+      onToggleAutoDelete: () => this.toggleAutoDelete(),
     }),
     this.uiElements.panel
   );
@@ -850,6 +881,19 @@ window.PanelManager.prototype.toggleAutoScrolling = function () {
   this.saveState();
   this.renderPanel();
   this.log(`Toggled auto-scrolling: ${!this.state.userRequestedAutoScrolling}`);
+};
+
+window.PanelManager.prototype.toggleAutoDelete = function () {
+  const running = Boolean(this.state.autoDeleteStatus?.running);
+  const nextState = !running;
+  this.log(
+    `PanelManager: Auto delete toggle requested -> ${nextState ? "start" : "stop"}`
+  );
+  this.document.dispatchEvent(
+    new CustomEvent(EVENTS.AUTO_DELETE_TOGGLE_REQUEST, {
+      detail: { enabled: nextState },
+    })
+  );
 };
 
 window.PanelManager.prototype.exportCsv = function () {

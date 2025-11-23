@@ -9,6 +9,7 @@ import { EVENTS } from "./events.js";
 import { PollingManager } from "./utils/PollingManager.js";
 import { domUtils } from "./dom/domUtils.js";
 import { DomService } from "./dom/DomService.js";
+import { AutoDeleteManager } from "./utils/AutoDeleteManager.js";
 
 class XGhosted {
   constructor({ document, window, config = {} }) {
@@ -47,6 +48,15 @@ class XGhosted {
       timing: this.timing,
       log: this.log,
       domService: this.domService,
+    });
+    this.autoDeleteManager = new AutoDeleteManager({
+      document: this.document,
+      window: this.window,
+      log: this.log,
+      domUtils,
+      emit: (eventName, detail) => this.emit(eventName, detail),
+      getUsername: () => this.state.userProfileName,
+      isWithReplies: () => this.state.isWithReplies,
     });
   }
 
@@ -185,11 +195,13 @@ class XGhosted {
       this.emit(EVENTS.USER_PROFILE_UPDATED, {
         userProfileName: this.state.userProfileName,
       });
+      this.autoDeleteManager.handleContextChange();
     }
     this.emit(EVENTS.CLEAR_POSTS, {});
     await this.waitForClearConfirmation();
     this.state.containerFound = false;
     this.emit(EVENTS.POSTS_CLEARED, {});
+    this.autoDeleteManager.handleContextChange();
     this.log(`URL change completed`);
   }
 
@@ -527,6 +539,16 @@ class XGhosted {
       },
       { capture: true }
     );
+
+    domUtils.addEventListener(
+      this.document,
+      EVENTS.AUTO_DELETE_TOGGLE_REQUEST,
+      ({ detail }) => {
+        const enabled = detail?.enabled ?? false;
+        this.log(`Auto delete toggle requested: ${enabled}`);
+        this.autoDeleteManager.handleToggle(Boolean(enabled));
+      }
+    );
   }
 
   init() {
@@ -549,6 +571,8 @@ class XGhosted {
     this.emit(EVENTS.STATE_UPDATED, {
       isRateLimited: this.state.isRateLimited,
     });
+
+    this.autoDeleteManager.handleContextChange();
 
     const styleSheet = domUtils.createElement("style", this.document);
     styleSheet.textContent = `

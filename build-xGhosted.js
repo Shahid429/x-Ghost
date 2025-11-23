@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import { format } from "prettier";
 import { execSync } from "child_process";
+import { pathToFileURL } from "url";
 
 const SRC_DIR = path.resolve("src");
 const OUTPUT_FILE = path.resolve(SRC_DIR, "xGhosted.user.js");
@@ -40,11 +41,15 @@ templateContent = templateContent
 // Dynamically import config.js and the compiled events.ts
 async function loadConfigAndEvents() {
   try {
-    const configModule = await import(path.resolve(SRC_DIR, "config.js"));
+    const configModule = await import(
+      pathToFileURL(path.resolve(SRC_DIR, "config.js")).href
+    );
     if (!configModule.CONFIG) {
       throw new Error("CONFIG export not found in config.js");
     }
-    const eventsModule = await import(path.resolve("dist", "events.js")); // Import compiled events.ts
+    const eventsModule = await import(
+      pathToFileURL(path.resolve("dist", "events.js")).href
+    ); // Import compiled events.ts
     if (!eventsModule.EVENTS || !eventsModule.EVENT_CONTRACTS) {
       throw new Error(
         "EVENTS or EVENT_CONTRACTS export not found in events.ts"

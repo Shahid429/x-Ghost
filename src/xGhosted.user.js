@@ -81,6 +81,8 @@
     SET_INITIAL_WAIT_TIME: 'xghosted:set-initial-wait-time',
     SET_POST_DENSITY: 'xghosted:set-post-density',
     SAVE_METRICS: 'xghosted:save-metrics',
+    AUTO_DELETE_TOGGLE_REQUEST: 'xghosted:auto-delete-toggle-request',
+    AUTO_DELETE_STATUS: 'xghosted:auto-delete-status',
   };
   const EVENT_CONTRACTS = {
     'xghosted:init-components': {
@@ -188,72 +190,21 @@
       count: 'number',
     },
     'xghosted:save-metrics': {},
+    'xghosted:auto-delete-toggle-request': {
+      enabled: 'boolean',
+    },
+    'xghosted:auto-delete-status': {
+      running: 'boolean',
+      deleting: 'boolean',
+      deletedCount: 'number',
+      username: 'string|null',
+      canRun: 'boolean',
+      message: 'string',
+    },
   };
 
   // --- Inject Shared Utilities ---
   window.XGhostedUtils = (function () {
-    // src/utils/Logger.js
-    var Logger = class {
-      constructor({ logTarget = 'tampermonkey' }) {
-        this.logTarget = logTarget;
-      }
-      log(...args) {
-        if (this.logTarget === 'console') {
-          console.log(...args);
-        } else {
-          GM_log(...args);
-        }
-      }
-    };
-    window.Logger = Logger;
-
-    // src/utils/debounce.js
-    function debounce(func, wait) {
-      let timeout;
-      return (...args) => {
-        clearTimeout(timeout);
-        return new Promise((resolve, reject) => {
-          timeout = setTimeout(() => {
-            try {
-              const result = func(...args);
-              if (result && typeof result.then === 'function') {
-                result.then(resolve).catch(reject);
-              } else {
-                resolve(result);
-              }
-            } catch (error) {
-              reject(error);
-            }
-          }, wait);
-        });
-      };
-    }
-
-    // src/config.js
-    var CONFIG = {
-      timing: {
-        debounceDelay: 500,
-        throttleDelay: 1e3,
-        tabCheckThrottle: 5e3,
-        exportThrottle: 5e3,
-        rateLimitPause: 20 * 1e3,
-        pollInterval: 500,
-        scrollInterval: 1500,
-        isPostScanningEnabledOnStartup: false,
-        // We'll send an event to change to true on the first heartbeat poll
-        userRequestedAutoScrollOnStartup: false,
-        checkPostMaxTries: 30,
-      },
-      showSplash: true,
-      logTarget: 'tampermonkey',
-      persistProcessedPosts: false,
-      linkPrefix: 'https://x.com',
-      debug: false,
-      smoothScrolling: true,
-      scrollPercentage: 1.5,
-      decoratePostsContainer: false,
-    };
-
     // src/events.ts
     var EVENTS = {
       INIT_COMPONENTS: 'xghosted:init-components',
@@ -293,6 +244,8 @@
       SET_INITIAL_WAIT_TIME: 'xghosted:set-initial-wait-time',
       SET_POST_DENSITY: 'xghosted:set-post-density',
       SAVE_METRICS: 'xghosted:save-metrics',
+      AUTO_DELETE_TOGGLE_REQUEST: 'xghosted:auto-delete-toggle-request',
+      AUTO_DELETE_STATUS: 'xghosted:auto-delete-status',
     };
     var EVENT_CONTRACTS = {
       [EVENTS.INIT_COMPONENTS]: { config: 'object' },
@@ -354,6 +307,580 @@
       [EVENTS.SET_INITIAL_WAIT_TIME]: { time: 'number' },
       [EVENTS.SET_POST_DENSITY]: { count: 'number' },
       [EVENTS.SAVE_METRICS]: {},
+      [EVENTS.AUTO_DELETE_TOGGLE_REQUEST]: { enabled: 'boolean' },
+      [EVENTS.AUTO_DELETE_STATUS]: {
+        running: 'boolean',
+        deleting: 'boolean',
+        deletedCount: 'number',
+        username: 'string|null',
+        canRun: 'boolean',
+        message: 'string',
+      },
+    };
+
+    // src/utils/AutoDeleteManager.js
+    var FLAGGED_SELECTOR = "div[data-testid='cellInnerDiv'][data-ghosted]";
+    var ARTICLE_SELECTOR = "article[data-testid='tweet']";
+    var CARET_SELECTORS = [
+      "button[aria-label='More']",
+      "div[aria-label='More']",
+      "button[data-testid='caret']",
+      "div[data-testid='caret']",
+    ];
+    var MENUITEM_SELECTOR = "[role='menuitem']";
+    var CONFIRM_SELECTOR = "button[data-testid='confirmationSheetConfirm']";
+    var PROBLEM_MARKERS = [
+      'postquality.problem',
+      'postquality.problem-adjacent',
+      'postquality.potential-problem',
+    ];
+    var DEFAULT_CONFIG = {
+      WAIT_BETWEEN_STEPS: 400,
+      WAIT_AFTER_DELETE: 500,
+      SCAN_INTERVAL: 4e3,
+      MENU_ATTEMPTS: 4,
+      CONFIRM_ATTEMPTS: 4,
+    };
+    var AutoDeleteManager = class {
+      constructor({
+        document: document2,
+        window: window2,
+        log,
+        domUtils: domUtils2,
+        emit,
+        getUsername,
+        isWithReplies,
+        config = {},
+      }) {
+        this.document = document2;
+        this.window = window2;
+        this.log = log || (() => {});
+        this.domUtils = domUtils2;
+        this.emit = emit;
+        this.getUsername = getUsername;
+        this.isWithReplies = isWithReplies;
+        this.config = { ...DEFAULT_CONFIG, ...config };
+        this.state = {
+          running: false,
+          deleting: false,
+          deletedCount: 0,
+          lastError: null,
+        };
+        this.loopHandle = null;
+      }
+      handleToggle(enabled) {
+        if (enabled) {
+          this.start();
+        } else {
+          this.stop();
+        }
+      }
+      start() {
+        if (this.state.running) {
+          return;
+        }
+        if (!this.canOperate()) {
+          this.state.lastError = this.getUnavailableReason();
+          this.emitStatus();
+          return;
+        }
+        this.state.running = true;
+        this.state.deletedCount = 0;
+        this.state.lastError = null;
+        this.log(`[AutoDelete] Started for @${this.getNormalizedUsername()}`);
+        this.ensureLoop();
+        this.emitStatus();
+        void this.runCycle();
+      }
+      stop(reason) {
+        if (!this.state.running) {
+          this.state.lastError = reason || this.state.lastError;
+          this.emitStatus();
+          return;
+        }
+        this.state.running = false;
+        if (reason) {
+          this.state.lastError = reason;
+        }
+        this.clearLoop();
+        this.log('[AutoDelete] Stopped');
+        this.emitStatus();
+      }
+      destroy() {
+        this.clearLoop();
+      }
+      handleContextChange() {
+        if (this.state.running && !this.canOperate()) {
+          this.stop(this.getUnavailableReason());
+          return;
+        }
+        this.emitStatus();
+      }
+      ensureLoop() {
+        if (this.loopHandle) {
+          return;
+        }
+        this.loopHandle = this.window.setInterval(() => {
+          void this.runCycle();
+        }, this.config.SCAN_INTERVAL);
+      }
+      clearLoop() {
+        if (this.loopHandle) {
+          this.window.clearInterval(this.loopHandle);
+          this.loopHandle = null;
+        }
+      }
+      async runCycle() {
+        if (!this.state.running || this.state.deleting) {
+          return;
+        }
+        if (!this.canOperate()) {
+          this.stop(this.getUnavailableReason());
+          return;
+        }
+        const article = this.findFirstFlaggedArticle();
+        if (!article) {
+          return;
+        }
+        this.state.deleting = true;
+        this.emitStatus();
+        try {
+          const deleted = await this.deleteArticle(article);
+          if (deleted) {
+            this.state.deletedCount += 1;
+            this.log(
+              `[AutoDelete] Deleted flagged post #${this.state.deletedCount}`
+            );
+          }
+        } catch (error) {
+          this.log(
+            `[AutoDelete] Error deleting post: ${error?.message || error}`
+          );
+          this.state.lastError = error?.message || String(error);
+        } finally {
+          this.state.deleting = false;
+          this.emitStatus();
+        }
+      }
+      async deleteArticle(article) {
+        const caret = await this.findCaretWithRetry(article);
+        if (!caret) {
+          this.log('[AutoDelete] Caret button not found');
+          return false;
+        }
+        caret.click();
+        await this.delay(this.config.WAIT_BETWEEN_STEPS);
+        const deleteClicked = await this.tryClickDeleteMenuItem();
+        if (!deleteClicked) {
+          this.log('[AutoDelete] Delete menu item not clicked');
+          return false;
+        }
+        const confirmed = await this.tryConfirmDelete();
+        if (!confirmed) {
+          this.log('[AutoDelete] Confirm delete button not found');
+          return false;
+        }
+        await this.delay(this.config.WAIT_AFTER_DELETE);
+        return true;
+      }
+      findFirstFlaggedArticle() {
+        const flaggedCells = this.getAllFlaggedCells();
+        for (const cell of flaggedCells) {
+          const article = this.getTargetArticleFromCell(cell);
+          if (article) {
+            return article;
+          }
+        }
+        return null;
+      }
+      getAllFlaggedCells() {
+        const nodes = Array.from(
+          this.document.querySelectorAll(FLAGGED_SELECTOR)
+        );
+        return nodes.filter((node) => {
+          const ghost = (node.getAttribute('data-ghosted') || '').toLowerCase();
+          return PROBLEM_MARKERS.some((marker) => ghost.includes(marker));
+        });
+      }
+      getTargetArticleFromCell(cell) {
+        const articles = Array.from(cell.querySelectorAll(ARTICLE_SELECTOR));
+        return articles.find((article) => this.isTweetByUser(article)) || null;
+      }
+      isTweetByUser(article) {
+        const username = this.getNormalizedUsername();
+        if (!article || !username) {
+          return false;
+        }
+        const links = Array.from(article.querySelectorAll("a[href^='/']"));
+        for (const link of links) {
+          const href = (link.getAttribute('href') || '').toLowerCase();
+          if (!href.startsWith('/')) {
+            continue;
+          }
+          if (href === `/${username}` || href.startsWith(`/${username}/`)) {
+            const repostMarker = article.querySelector(
+              "button[data-testid='unretweet']"
+            );
+            if (repostMarker) {
+              return false;
+            }
+            return true;
+          }
+        }
+        return false;
+      }
+      async findCaretWithRetry(article, maxRetries = 5, delayMs = 250) {
+        for (let i = 0; i < maxRetries; i++) {
+          const caret = CARET_SELECTORS.map((selector) =>
+            article.querySelector(selector)
+          ).find((el) => this.isVisible(el));
+          if (caret) {
+            return caret;
+          }
+          await this.delay(delayMs);
+        }
+        return null;
+      }
+      async tryClickDeleteMenuItem() {
+        for (let attempt = 0; attempt < this.config.MENU_ATTEMPTS; attempt++) {
+          await this.delay(this.config.WAIT_BETWEEN_STEPS * (attempt + 1));
+          const menuItems = this.document.querySelectorAll(MENUITEM_SELECTOR);
+          for (const item of menuItems) {
+            const label = (item.innerText || '').toLowerCase();
+            if (label.includes('delete')) {
+              item.click();
+              return true;
+            }
+          }
+        }
+        return false;
+      }
+      async tryConfirmDelete() {
+        for (
+          let attempt = 0;
+          attempt < this.config.CONFIRM_ATTEMPTS;
+          attempt++
+        ) {
+          await this.delay(this.config.WAIT_BETWEEN_STEPS * (attempt + 1));
+          const confirmBtn = this.document.querySelector(CONFIRM_SELECTOR);
+          if (this.isVisible(confirmBtn)) {
+            confirmBtn.click();
+            return true;
+          }
+        }
+        return false;
+      }
+      canOperate() {
+        return Boolean(this.getNormalizedUsername()) && this.isOnRepliesPage();
+      }
+      isOnRepliesPage() {
+        const username = this.getNormalizedUsername();
+        if (!username) {
+          return false;
+        }
+        const pathname = this.window.location.pathname.toLowerCase();
+        return (
+          this.isWithReplies() &&
+          pathname.startsWith(`/${username}`) &&
+          pathname.endsWith('/with_replies')
+        );
+      }
+      getUnavailableReason() {
+        if (!this.getNormalizedUsername()) {
+          return "Open your profile's /with_replies page to capture the username.";
+        }
+        if (!this.isWithReplies()) {
+          return 'Auto delete is only available on the /with_replies view.';
+        }
+        return 'Navigate to your own /with_replies page to enable auto delete.';
+      }
+      emitStatus() {
+        const detail = {
+          running: this.state.running,
+          deleting: this.state.deleting,
+          deletedCount: this.state.deletedCount,
+          username: this.getNormalizedUsername() || null,
+          canRun: this.canOperate(),
+          message: this.state.lastError || this.composeMessage(),
+        };
+        this.emit(EVENTS.AUTO_DELETE_STATUS, detail);
+      }
+      composeMessage() {
+        if (!this.getNormalizedUsername()) {
+          return 'Open a /with_replies page to detect your username.';
+        }
+        if (!this.isWithReplies()) {
+          return 'Auto delete becomes available on /with_replies.';
+        }
+        if (this.state.deleting) {
+          return 'Deleting a flagged reply...';
+        }
+        if (this.state.running) {
+          return 'Scanning flagged replies...';
+        }
+        return 'Ready to delete flagged replies.';
+      }
+      getNormalizedUsername() {
+        const raw = (this.getUsername?.() || '').trim().replace(/^@/, '');
+        return raw.toLowerCase();
+      }
+      isVisible(el) {
+        return Boolean(
+          el &&
+            (el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+        );
+      }
+      delay(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+    };
+
+    // src/utils/clipboardUtils.js
+    function copyTextToClipboard(text, log) {
+      return navigator.clipboard
+        .writeText(text)
+        .then(() => log('Text copied to clipboard'))
+        .catch((err) => log(`Clipboard copy failed: ${err}`));
+    }
+    function exportToCSV(data, filename, doc, log) {
+      const blob = new Blob([data], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = doc.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+      log(`Exported CSV: ${filename}`);
+    }
+
+    // src/utils/debounce.js
+    function debounce(func, wait) {
+      let timeout;
+      return (...args) => {
+        clearTimeout(timeout);
+        return new Promise((resolve, reject) => {
+          timeout = setTimeout(() => {
+            try {
+              const result = func(...args);
+              if (result && typeof result.then === 'function') {
+                result.then(resolve).catch(reject);
+              } else {
+                resolve(result);
+              }
+            } catch (error) {
+              reject(error);
+            }
+          }, wait);
+        });
+      };
+    }
+
+    // src/utils/postQuality.js
+    var postQuality = Object.freeze({
+      UNDEFINED: Object.freeze({ name: 'Undefined Container', value: 0 }),
+      DIVIDER: Object.freeze({ name: 'Invisible Divider', value: 1 }),
+      PROBLEM: Object.freeze({ name: 'Problem', value: 2 }),
+      PROBLEM_ADJACENT: Object.freeze({
+        name: 'Problem by Association',
+        value: 3,
+      }),
+      POTENTIAL_PROBLEM: Object.freeze({ name: 'Potential Problem', value: 4 }),
+      GOOD: Object.freeze({ name: 'Good', value: 5 }),
+    });
+
+    // src/utils/summarizeRatedPosts.js
+    function summarizeRatedPosts(analyses) {
+      const summary = {
+        [postQuality.UNDEFINED.name]: 0,
+        [postQuality.DIVIDER.name]: 0,
+        [postQuality.PROBLEM.name]: 0,
+        [postQuality.PROBLEM_ADJACENT.name]: 0,
+        [postQuality.POTENTIAL_PROBLEM.name]: 0,
+        [postQuality.GOOD.name]: 0,
+      };
+      if (!Array.isArray(analyses)) {
+        return summary;
+      }
+      analyses.forEach((analysis) => {
+        if (analysis && analysis.quality && analysis.quality.name) {
+          summary[analysis.quality.name]++;
+        }
+      });
+      return summary;
+    }
+
+    // src/utils/postConnector.js
+    var postConnector = Object.freeze({
+      DIVIDES: Object.freeze({ name: 'Invisibly Dividing', value: 0 }),
+      INDEPENDENT: Object.freeze({ name: 'Standing Alone', value: 1 }),
+      STARTS: Object.freeze({ name: 'Starting', value: 2 }),
+      CONTINUES: Object.freeze({ name: 'Continuing', value: 3 }),
+      DANGLES: Object.freeze({ name: 'Dangling', value: 4 }),
+    });
+
+    // src/utils/summarizeConnectedPosts.js
+    function summarizeConnectedPosts(analyses) {
+      const summary = {
+        [postConnector.DIVIDES.name]: 0,
+        [postConnector.INDEPENDENT.name]: 0,
+        [postConnector.STARTS.name]: 0,
+        [postConnector.CONTINUES.name]: 0,
+        [postConnector.DANGLES.name]: 0,
+      };
+      if (!Array.isArray(analyses)) {
+        return summary;
+      }
+      analyses.forEach((analysis) => {
+        if (analysis && analysis.connector && analysis.connector.name) {
+          summary[analysis.connector.name]++;
+        }
+      });
+      return summary;
+    }
+
+    // src/utils/describeSampleAnalyses.js
+    function describeSampleAnalyses(document2, analyses) {
+      const {
+        GOOD,
+        PROBLEM,
+        PROBLEM_ADJACENT,
+        POTENTIAL_PROBLEM,
+        DIVIDER,
+        UNDEFINED,
+      } = postQuality;
+      const { DIVIDES, INDEPENDENT, STARTS, CONTINUES, DANGLES } =
+        postConnector;
+      const totalPosts = document2.querySelectorAll(
+        'div[data-testid="cellInnerDiv"]'
+      ).length;
+      const totalArticles = document2.querySelectorAll(
+        'article:not(article article)'
+      ).length;
+      const totalNestedArticles =
+        document2.querySelectorAll('article article').length;
+      const postQualitySummary = summarizeRatedPosts(analyses);
+      const postConnectorSummary = summarizeConnectedPosts(analyses);
+      const $padding = 2;
+      const totalGood = postQualitySummary[GOOD.name];
+      const totalPotentialProblems = postQualitySummary[POTENTIAL_PROBLEM.name];
+      const totalProblems = postQualitySummary[PROBLEM.name];
+      const totalAdjacentProblems = postQualitySummary[PROBLEM_ADJACENT.name];
+      const totalDividers = postQualitySummary[DIVIDER.name];
+      const totalUndefined = postQualitySummary[UNDEFINED.name];
+      const totalDivides = postConnectorSummary[DIVIDES.name];
+      const totalINDEPENDENT = postConnectorSummary[INDEPENDENT.name];
+      const totalStarts = postConnectorSummary[STARTS.name];
+      const totalContinues = postConnectorSummary[CONTINUES.name];
+      const totalDangles = postConnectorSummary[DANGLES.name];
+      return [
+        `Structure Summary Totals:`,
+        `  ${`${totalPosts}`.padStart($padding, ' ')} Posts`,
+        `  ${`${totalArticles}`.padStart($padding, ' ')} Articles`,
+        `  ${`${totalNestedArticles}`.padStart($padding, ' ')} Nested Articles`,
+        ``,
+        `Rated Post Quality Totals:`,
+        `  ${`${totalGood}`.padStart($padding, ' ')} ${GOOD.name}`,
+        `  ${`${totalPotentialProblems}`.padStart($padding, ' ')} ${POTENTIAL_PROBLEM.name}`,
+        `  ${`${totalProblems}`.padStart($padding, ' ')} ${PROBLEM.name}`,
+        `  ${`${totalAdjacentProblems}`.padStart($padding, ' ')} ${PROBLEM_ADJACENT.name}`,
+        `  ${`${totalDividers}`.padStart($padding, ' ')} ${DIVIDER.name}`,
+        `  ${`${totalUndefined}`.padStart($padding, ' ')} ${UNDEFINED.name}`,
+        ``,
+        `Post Connections Totals:`,
+        `  ${`${totalDivides}`.padStart($padding, ' ')} ${DIVIDES.name}`,
+        `  ${`${totalINDEPENDENT}`.padStart($padding, ' ')} ${INDEPENDENT.name}`,
+        `  ${`${totalStarts}`.padStart($padding, ' ')} ${STARTS.name}`,
+        `  ${`${totalContinues}`.padStart($padding, ' ')} ${CONTINUES.name}`,
+        `  ${`${totalDangles}`.padStart($padding, ' ')} ${DANGLES.name}`,
+      ].join('\n');
+    }
+
+    // src/utils/getPostEngagement.js
+    function getPostEngagement(post) {
+      const engagementContainer = post.querySelector('[role="group"]');
+      if (engagementContainer) {
+        const replyCount =
+          engagementContainer.querySelector('[data-testid="reply"] span')
+            ?.textContent || '0';
+        const likeCount =
+          engagementContainer.querySelector(
+            '[data-testid="like"] span, [data-testid="unlike"] span'
+          )?.textContent || '0';
+        const repostCount =
+          engagementContainer.querySelector('[data-testid="retweet"] span')
+            ?.textContent || '0';
+        const impressionElement = engagementContainer.querySelector(
+          '[href*="/analytics"] [data-testid="app-text-transition-container"] span'
+        );
+        let impressionCount = impressionElement?.textContent || '0';
+        impressionCount = parseImpressionCount(impressionCount);
+        return {
+          replyCount: parseInt(replyCount) || 0,
+          likeCount: parseInt(likeCount) || 0,
+          repostCount: parseInt(repostCount) || 0,
+          impressionCount,
+        };
+      }
+      return {
+        replyCount: 0,
+        likeCount: 0,
+        repostCount: 0,
+        impressionCount: 0,
+      };
+    }
+    function parseImpressionCount(impressionText) {
+      if (!impressionText || typeof impressionText !== 'string') return 0;
+      impressionText = impressionText.trim().toLowerCase();
+      if (impressionText.endsWith('k')) {
+        const num = parseFloat(impressionText.replace('k', ''));
+        return isNaN(num) ? 0 : Math.round(num * 1e3);
+      } else if (impressionText.endsWith('m')) {
+        const num = parseFloat(impressionText.replace('m', ''));
+        return isNaN(num) ? 0 : Math.round(num * 1e6);
+      } else {
+        const num = parseInt(impressionText);
+        return isNaN(num) ? 0 : num;
+      }
+    }
+
+    // src/utils/Logger.js
+    var Logger = class {
+      constructor({ logTarget = 'tampermonkey' }) {
+        this.logTarget = logTarget;
+      }
+      log(...args) {
+        if (this.logTarget === 'console') {
+          console.log(...args);
+        } else {
+          GM_log(...args);
+        }
+      }
+    };
+    window.Logger = Logger;
+
+    // src/config.js
+    var CONFIG = {
+      timing: {
+        debounceDelay: 500,
+        throttleDelay: 1e3,
+        tabCheckThrottle: 5e3,
+        exportThrottle: 5e3,
+        rateLimitPause: 20 * 1e3,
+        pollInterval: 500,
+        scrollInterval: 1500,
+        isPostScanningEnabledOnStartup: false,
+        // We'll send an event to change to true on the first heartbeat poll
+        userRequestedAutoScrollOnStartup: false,
+        checkPostMaxTries: 30,
+      },
+      showSplash: true,
+      logTarget: 'tampermonkey',
+      persistProcessedPosts: false,
+      linkPrefix: 'https://x.com',
+      debug: false,
+      smoothScrolling: true,
+      scrollPercentage: 1.5,
+      decoratePostsContainer: false,
     };
 
     // src/utils/PollingManager.js
@@ -631,192 +1158,6 @@
         this.initializePostScanning();
       }
     };
-
-    // src/utils/clipboardUtils.js
-    function copyTextToClipboard(text, log) {
-      return navigator.clipboard
-        .writeText(text)
-        .then(() => log('Text copied to clipboard'))
-        .catch((err) => log(`Clipboard copy failed: ${err}`));
-    }
-    function exportToCSV(data, filename, doc, log) {
-      const blob = new Blob([data], { type: 'text/csv;charset=utf-8;' });
-      const url = URL.createObjectURL(blob);
-      const a = doc.createElement('a');
-      a.href = url;
-      a.download = filename;
-      a.click();
-      URL.revokeObjectURL(url);
-      log(`Exported CSV: ${filename}`);
-    }
-
-    // src/utils/postQuality.js
-    var postQuality = Object.freeze({
-      UNDEFINED: Object.freeze({ name: 'Undefined Container', value: 0 }),
-      DIVIDER: Object.freeze({ name: 'Invisible Divider', value: 1 }),
-      PROBLEM: Object.freeze({ name: 'Problem', value: 2 }),
-      PROBLEM_ADJACENT: Object.freeze({
-        name: 'Problem by Association',
-        value: 3,
-      }),
-      POTENTIAL_PROBLEM: Object.freeze({ name: 'Potential Problem', value: 4 }),
-      GOOD: Object.freeze({ name: 'Good', value: 5 }),
-    });
-
-    // src/utils/summarizeRatedPosts.js
-    function summarizeRatedPosts(analyses) {
-      const summary = {
-        [postQuality.UNDEFINED.name]: 0,
-        [postQuality.DIVIDER.name]: 0,
-        [postQuality.PROBLEM.name]: 0,
-        [postQuality.PROBLEM_ADJACENT.name]: 0,
-        [postQuality.POTENTIAL_PROBLEM.name]: 0,
-        [postQuality.GOOD.name]: 0,
-      };
-      if (!Array.isArray(analyses)) {
-        return summary;
-      }
-      analyses.forEach((analysis) => {
-        if (analysis && analysis.quality && analysis.quality.name) {
-          summary[analysis.quality.name]++;
-        }
-      });
-      return summary;
-    }
-
-    // src/utils/postConnector.js
-    var postConnector = Object.freeze({
-      DIVIDES: Object.freeze({ name: 'Invisibly Dividing', value: 0 }),
-      INDEPENDENT: Object.freeze({ name: 'Standing Alone', value: 1 }),
-      STARTS: Object.freeze({ name: 'Starting', value: 2 }),
-      CONTINUES: Object.freeze({ name: 'Continuing', value: 3 }),
-      DANGLES: Object.freeze({ name: 'Dangling', value: 4 }),
-    });
-
-    // src/utils/summarizeConnectedPosts.js
-    function summarizeConnectedPosts(analyses) {
-      const summary = {
-        [postConnector.DIVIDES.name]: 0,
-        [postConnector.INDEPENDENT.name]: 0,
-        [postConnector.STARTS.name]: 0,
-        [postConnector.CONTINUES.name]: 0,
-        [postConnector.DANGLES.name]: 0,
-      };
-      if (!Array.isArray(analyses)) {
-        return summary;
-      }
-      analyses.forEach((analysis) => {
-        if (analysis && analysis.connector && analysis.connector.name) {
-          summary[analysis.connector.name]++;
-        }
-      });
-      return summary;
-    }
-
-    // src/utils/describeSampleAnalyses.js
-    function describeSampleAnalyses(document2, analyses) {
-      const {
-        GOOD,
-        PROBLEM,
-        PROBLEM_ADJACENT,
-        POTENTIAL_PROBLEM,
-        DIVIDER,
-        UNDEFINED,
-      } = postQuality;
-      const { DIVIDES, INDEPENDENT, STARTS, CONTINUES, DANGLES } =
-        postConnector;
-      const totalPosts = document2.querySelectorAll(
-        'div[data-testid="cellInnerDiv"]'
-      ).length;
-      const totalArticles = document2.querySelectorAll(
-        'article:not(article article)'
-      ).length;
-      const totalNestedArticles =
-        document2.querySelectorAll('article article').length;
-      const postQualitySummary = summarizeRatedPosts(analyses);
-      const postConnectorSummary = summarizeConnectedPosts(analyses);
-      const $padding = 2;
-      const totalGood = postQualitySummary[GOOD.name];
-      const totalPotentialProblems = postQualitySummary[POTENTIAL_PROBLEM.name];
-      const totalProblems = postQualitySummary[PROBLEM.name];
-      const totalAdjacentProblems = postQualitySummary[PROBLEM_ADJACENT.name];
-      const totalDividers = postQualitySummary[DIVIDER.name];
-      const totalUndefined = postQualitySummary[UNDEFINED.name];
-      const totalDivides = postConnectorSummary[DIVIDES.name];
-      const totalINDEPENDENT = postConnectorSummary[INDEPENDENT.name];
-      const totalStarts = postConnectorSummary[STARTS.name];
-      const totalContinues = postConnectorSummary[CONTINUES.name];
-      const totalDangles = postConnectorSummary[DANGLES.name];
-      return [
-        `Structure Summary Totals:`,
-        `  ${`${totalPosts}`.padStart($padding, ' ')} Posts`,
-        `  ${`${totalArticles}`.padStart($padding, ' ')} Articles`,
-        `  ${`${totalNestedArticles}`.padStart($padding, ' ')} Nested Articles`,
-        ``,
-        `Rated Post Quality Totals:`,
-        `  ${`${totalGood}`.padStart($padding, ' ')} ${GOOD.name}`,
-        `  ${`${totalPotentialProblems}`.padStart($padding, ' ')} ${POTENTIAL_PROBLEM.name}`,
-        `  ${`${totalProblems}`.padStart($padding, ' ')} ${PROBLEM.name}`,
-        `  ${`${totalAdjacentProblems}`.padStart($padding, ' ')} ${PROBLEM_ADJACENT.name}`,
-        `  ${`${totalDividers}`.padStart($padding, ' ')} ${DIVIDER.name}`,
-        `  ${`${totalUndefined}`.padStart($padding, ' ')} ${UNDEFINED.name}`,
-        ``,
-        `Post Connections Totals:`,
-        `  ${`${totalDivides}`.padStart($padding, ' ')} ${DIVIDES.name}`,
-        `  ${`${totalINDEPENDENT}`.padStart($padding, ' ')} ${INDEPENDENT.name}`,
-        `  ${`${totalStarts}`.padStart($padding, ' ')} ${STARTS.name}`,
-        `  ${`${totalContinues}`.padStart($padding, ' ')} ${CONTINUES.name}`,
-        `  ${`${totalDangles}`.padStart($padding, ' ')} ${DANGLES.name}`,
-      ].join('\n');
-    }
-
-    // src/utils/getPostEngagement.js
-    function getPostEngagement(post) {
-      const engagementContainer = post.querySelector('[role="group"]');
-      if (engagementContainer) {
-        const replyCount =
-          engagementContainer.querySelector('[data-testid="reply"] span')
-            ?.textContent || '0';
-        const likeCount =
-          engagementContainer.querySelector(
-            '[data-testid="like"] span, [data-testid="unlike"] span'
-          )?.textContent || '0';
-        const repostCount =
-          engagementContainer.querySelector('[data-testid="retweet"] span')
-            ?.textContent || '0';
-        const impressionElement = engagementContainer.querySelector(
-          '[href*="/analytics"] [data-testid="app-text-transition-container"] span'
-        );
-        let impressionCount = impressionElement?.textContent || '0';
-        impressionCount = parseImpressionCount(impressionCount);
-        return {
-          replyCount: parseInt(replyCount) || 0,
-          likeCount: parseInt(likeCount) || 0,
-          repostCount: parseInt(repostCount) || 0,
-          impressionCount,
-        };
-      }
-      return {
-        replyCount: 0,
-        likeCount: 0,
-        repostCount: 0,
-        impressionCount: 0,
-      };
-    }
-    function parseImpressionCount(impressionText) {
-      if (!impressionText || typeof impressionText !== 'string') return 0;
-      impressionText = impressionText.trim().toLowerCase();
-      if (impressionText.endsWith('k')) {
-        const num = parseFloat(impressionText.replace('k', ''));
-        return isNaN(num) ? 0 : Math.round(num * 1e3);
-      } else if (impressionText.endsWith('m')) {
-        const num = parseFloat(impressionText.replace('m', ''));
-        return isNaN(num) ? 0 : Math.round(num * 1e6);
-      } else {
-        const num = parseInt(impressionText);
-        return isNaN(num) ? 0 : num;
-      }
-    }
 
     // src/utils/postConnectorNameGetter.js
     function postConnectorNameGetter(connector) {
@@ -1405,6 +1746,7 @@
       return tagContainerDiv(containerDiv, log);
     }
     return {
+      AutoDeleteManager,
       CONFIG,
       DomService,
       EVENTS,
@@ -1473,11 +1815,125 @@
       postQualityClassNameGetter,
       parseUrl,
       CONFIG,
-      EVENTS,
       PollingManager,
       domUtils,
       DomService,
+      AutoDeleteManager,
     } = window.XGhostedUtils;
+    // src/xGhosted.js
+    // src/events.ts
+    var EVENTS = {
+      INIT_COMPONENTS: 'xghosted:init-components',
+      POST_REGISTERED: 'xghosted:post-registered',
+      POST_REQUESTED: 'xghosted:post-requested',
+      POST_RETRIEVED: 'xghosted:post-retrieved',
+      REQUEST_POST_CHECK: 'xghosted:request-post-check',
+      CLEAR_POSTS: 'xghosted:clear-posts',
+      CLEAR_POSTS_UI: 'xghosted:clear-posts-ui',
+      POSTS_CLEARED: 'xghosted:posts-cleared',
+      POSTS_CLEARED_CONFIRMED: 'xghosted:posts-cleared-confirmed',
+      REQUEST_POSTS: 'xghosted:request-posts',
+      POSTS_RETRIEVED: 'xghosted:posts-retrieved',
+      CSV_IMPORTED: 'xghosted:csv-imported',
+      REQUEST_IMPORT_CSV: 'xghosted:request-import-csv',
+      EXPORT_CSV: 'xghosted:export-csv',
+      CSV_EXPORTED: 'xghosted:csv-exported',
+      SET_SCANNING: 'xghosted:set-scanning',
+      SCANNING_STATE_UPDATED: 'xghosted:scanning-state-updated',
+      SET_AUTO_SCROLLING: 'xghosted:set-auto-scrolling',
+      AUTO_SCROLLING_TOGGLED: 'xghosted:auto-scrolling-toggled',
+      RATE_LIMIT_DETECTED: 'xghosted:rate-limit-detected',
+      USER_PROFILE_UPDATED: 'xghosted:user-profile-updated',
+      INIT: 'xghosted:init',
+      STATE_UPDATED: 'xghosted:state-updated',
+      OPEN_ABOUT: 'xghosted:open-about',
+      TOGGLE_PANEL_VISIBILITY: 'xghosted:toggle-panel-visibility',
+      COPY_LINKS: 'xghosted:copy-links',
+      REQUEST_METRICS: 'xghosted:request-metrics',
+      METRICS_RETRIEVED: 'xghosted:metrics-retrieved',
+      EXPORT_METRICS: 'xghosted:export-metrics',
+      METRICS_UPDATED: 'xghosted:metrics-updated',
+      RECORD_POLL: 'xghosted:record-poll',
+      RECORD_SCROLL: 'xghosted:record-scroll',
+      RECORD_SCAN: 'xghosted:record-scan',
+      RECORD_TAB_CHECK: 'xghosted:record-tab-check',
+      SET_INITIAL_WAIT_TIME: 'xghosted:set-initial-wait-time',
+      SET_POST_DENSITY: 'xghosted:set-post-density',
+      SAVE_METRICS: 'xghosted:save-metrics',
+      AUTO_DELETE_TOGGLE_REQUEST: 'xghosted:auto-delete-toggle-request',
+      AUTO_DELETE_STATUS: 'xghosted:auto-delete-status',
+    };
+    var EVENT_CONTRACTS = {
+      [EVENTS.INIT_COMPONENTS]: { config: 'object' },
+      [EVENTS.POST_REGISTERED]: { href: 'string', data: 'object' },
+      [EVENTS.POST_REQUESTED]: { href: 'string' },
+      [EVENTS.POST_RETRIEVED]: { href: 'string', post: 'object|null' },
+      [EVENTS.REQUEST_POST_CHECK]: { href: 'string' },
+      [EVENTS.CLEAR_POSTS]: {},
+      [EVENTS.CLEAR_POSTS_UI]: {},
+      [EVENTS.POSTS_CLEARED]: {},
+      [EVENTS.POSTS_CLEARED_CONFIRMED]: {},
+      [EVENTS.REQUEST_POSTS]: {},
+      [EVENTS.POSTS_RETRIEVED]: { posts: 'array' },
+      [EVENTS.CSV_IMPORTED]: { importedCount: 'number' },
+      [EVENTS.REQUEST_IMPORT_CSV]: { csvText: 'string' },
+      [EVENTS.EXPORT_CSV]: {},
+      [EVENTS.CSV_EXPORTED]: { csvData: 'string' },
+      [EVENTS.SET_SCANNING]: { enabled: 'boolean' },
+      [EVENTS.SCANNING_STATE_UPDATED]: { isPostScanningEnabled: 'boolean' },
+      [EVENTS.SET_AUTO_SCROLLING]: { enabled: 'boolean' },
+      [EVENTS.AUTO_SCROLLING_TOGGLED]: {
+        userRequestedAutoScrolling: 'boolean',
+      },
+      [EVENTS.RATE_LIMIT_DETECTED]: { pauseDuration: 'number' },
+      [EVENTS.USER_PROFILE_UPDATED]: { userProfileName: 'string|null' },
+      [EVENTS.INIT]: { config: 'object' },
+      [EVENTS.STATE_UPDATED]: { isRateLimited: 'boolean' },
+      [EVENTS.OPEN_ABOUT]: {},
+      [EVENTS.TOGGLE_PANEL_VISIBILITY]: { isPanelVisible: 'boolean' },
+      [EVENTS.COPY_LINKS]: {},
+      [EVENTS.REQUEST_METRICS]: {},
+      [EVENTS.METRICS_RETRIEVED]: { timingHistory: 'array' },
+      [EVENTS.EXPORT_METRICS]: {},
+      [EVENTS.METRICS_UPDATED]: { metrics: 'object' },
+      [EVENTS.RECORD_POLL]: {
+        postsProcessed: 'number',
+        wasSkipped: 'boolean',
+        containerFound: 'boolean',
+        containerAttempted: 'boolean',
+        pageType: 'string',
+        isScanningStarted: 'boolean',
+        isScanningStopped: 'boolean',
+        cellInnerDivCount: 'number',
+      },
+      [EVENTS.RECORD_SCROLL]: { bottomReached: 'boolean' },
+      [EVENTS.RECORD_SCAN]: {
+        duration: 'number',
+        postsProcessed: 'number',
+        wasSkipped: 'boolean',
+        interval: 'number',
+        isAutoScrolling: 'boolean',
+      },
+      [EVENTS.RECORD_TAB_CHECK]: {
+        duration: 'number',
+        success: 'boolean',
+        rateLimited: 'boolean',
+        attempts: 'number',
+      },
+      [EVENTS.SET_INITIAL_WAIT_TIME]: { time: 'number' },
+      [EVENTS.SET_POST_DENSITY]: { count: 'number' },
+      [EVENTS.SAVE_METRICS]: {},
+      [EVENTS.AUTO_DELETE_TOGGLE_REQUEST]: { enabled: 'boolean' },
+      [EVENTS.AUTO_DELETE_STATUS]: {
+        running: 'boolean',
+        deleting: 'boolean',
+        deletedCount: 'number',
+        username: 'string|null',
+        canRun: 'boolean',
+        message: 'string',
+      },
+    };
+
     // src/xGhosted.js
     var XGhosted = class {
       constructor({ document: document2, window, config = {} }) {
@@ -1521,6 +1977,15 @@
           timing: this.timing,
           log: this.log,
           domService: this.domService,
+        });
+        this.autoDeleteManager = new AutoDeleteManager({
+          document: this.document,
+          window: this.window,
+          log: this.log,
+          domUtils,
+          emit: (eventName, detail) => this.emit(eventName, detail),
+          getUsername: () => this.state.userProfileName,
+          isWithReplies: () => this.state.isWithReplies,
         });
       }
       emit(eventName, data) {
@@ -1655,11 +2120,13 @@
           this.emit(EVENTS.USER_PROFILE_UPDATED, {
             userProfileName: this.state.userProfileName,
           });
+          this.autoDeleteManager.handleContextChange();
         }
         this.emit(EVENTS.CLEAR_POSTS, {});
         await this.waitForClearConfirmation();
         this.state.containerFound = false;
         this.emit(EVENTS.POSTS_CLEARED, {});
+        this.autoDeleteManager.handleContextChange();
         this.log(`URL change completed`);
       }
       async detectAndHandleUrlChange(url) {
@@ -1988,6 +2455,15 @@
           },
           { capture: true }
         );
+        domUtils.addEventListener(
+          this.document,
+          EVENTS.AUTO_DELETE_TOGGLE_REQUEST,
+          ({ detail }) => {
+            const enabled = detail?.enabled ?? false;
+            this.log(`Auto delete toggle requested: ${enabled}`);
+            this.autoDeleteManager.handleToggle(Boolean(enabled));
+          }
+        );
       }
       init() {
         this.log('Initializing XGhosted...');
@@ -2005,6 +2481,7 @@
         this.emit(EVENTS.STATE_UPDATED, {
           isRateLimited: this.state.isRateLimited,
         });
+        this.autoDeleteManager.handleContextChange();
         const styleSheet = domUtils.createElement('style', this.document);
         styleSheet.textContent = `
     .ghosted-good { border: 2px solid green; background: rgba(0, 255, 0, 0.15); }
@@ -2048,7 +2525,6 @@
     return XGhosted;
   })();
   window.PanelManager = (function () {
-    const { CONFIG, EVENTS } = window.XGhostedUtils;
     // src/ui/Panel.jsx
     function Panel({
       state,
@@ -2075,10 +2551,32 @@
       onClearPosts,
       onOpenAbout,
       onToggleDropdown,
+      autoDeleteStatus,
+      onToggleAutoDelete,
     }) {
       const themeOptions = ['dark', 'dim', 'light'].filter(
         (option) => option !== currentMode
       );
+      const autoDelete = autoDeleteStatus || {};
+      const autoDeleteButtonLabel = autoDelete.running
+        ? 'Stop Auto Delete'
+        : 'Start Auto Delete';
+      const autoDeleteStatusLabel = autoDelete.deleting
+        ? 'Deleting\u2026'
+        : autoDelete.running
+          ? 'Running'
+          : autoDelete.canRun
+            ? 'Ready'
+            : 'Unavailable';
+      const autoDeleteUsernameLabel = autoDelete.username
+        ? `@${autoDelete.username}`
+        : 'Username not detected';
+      const autoDeleteCountLabel = `Deleted ${autoDelete.deletedCount || 0}`;
+      const autoDeleteDisabled = !autoDelete.running && !autoDelete.canRun;
+      const autoDeleteIcon = autoDelete.running
+        ? 'fa-solid fa-stop'
+        : 'fa-solid fa-play';
+      const toolbarButtonStyle = { flex: '1 1 120px', minWidth: '100px' };
       return window.preact.h(
         'div',
         null,
@@ -2108,7 +2606,14 @@
                 null,
                 window.preact.h(
                   'div',
-                  { className: 'toolbar' },
+                  {
+                    className: 'toolbar',
+                    style: {
+                      display: 'flex',
+                      flexWrap: 'wrap',
+                      gap: '8px',
+                    },
+                  },
                   window.preact.h(
                     'button',
                     {
@@ -2118,6 +2623,7 @@
                       className: 'panel-button',
                       onClick: onToggleTools,
                       'aria-label': 'Toggle Tools Section',
+                      style: toolbarButtonStyle,
                     },
                     window.preact.h('i', {
                       className: state.isToolsExpanded
@@ -2128,64 +2634,134 @@
                     'Tools'
                   ),
                   window.preact.h(
+                    'button',
+                    {
+                      key: isScanning ? 'scanning-stop' : 'scanning-start',
+                      className: `panel-button ${isScanning ? '' : 'scanning-stopped'}`,
+                      onClick: onToggleScanning,
+                      'aria-label': isScanning
+                        ? 'Stop Scanning'
+                        : 'Start Scanning',
+                      style: toolbarButtonStyle,
+                    },
+                    window.preact.h('i', {
+                      className: isScanning
+                        ? 'fa-solid fa-stop'
+                        : 'fa-solid fa-play',
+                      style: { marginRight: '12px' },
+                    }),
+                    'Scan'
+                  ),
+                  window.preact.h(
+                    'button',
+                    {
+                      key: isScrolling ? 'scroll-stop' : 'scroll-start',
+                      className: 'panel-button',
+                      onClick: onToggleAutoScrolling,
+                      'aria-label': isScrolling
+                        ? 'Stop Auto-Scroll'
+                        : 'Start Auto-Scroll',
+                      style: toolbarButtonStyle,
+                    },
+                    window.preact.h('i', {
+                      className: isScrolling
+                        ? 'fa-solid fa-stop'
+                        : 'fa-solid fa-play',
+                      style: { marginRight: '12px' },
+                    }),
+                    'Scroll'
+                  ),
+                  window.preact.h(
+                    'button',
+                    {
+                      key: autoDelete.running
+                        ? 'autodelete-stop'
+                        : 'autodelete-start',
+                      className: 'panel-button',
+                      onClick: onToggleAutoDelete,
+                      'aria-label': autoDeleteButtonLabel,
+                      title: autoDeleteStatusLabel,
+                      disabled: autoDeleteDisabled,
+                      style: {
+                        ...toolbarButtonStyle,
+                        ...(autoDeleteDisabled
+                          ? { opacity: 0.5, cursor: 'not-allowed' }
+                          : {}),
+                      },
+                    },
+                    window.preact.h('i', {
+                      className: autoDeleteIcon,
+                      style: { marginRight: '12px' },
+                    }),
+                    'Delete'
+                  ),
+                  window.preact.h(
+                    'button',
+                    {
+                      className: 'panel-button',
+                      onClick: onToggleVisibility,
+                      'aria-label': 'Hide Panel',
+                      style: toolbarButtonStyle,
+                    },
+                    window.preact.h('i', {
+                      className: 'fas fa-eye-slash',
+                      style: { marginRight: '12px' },
+                    }),
+                    'Hide'
+                  )
+                ),
+                window.preact.h(
+                  'div',
+                  {
+                    style: {
+                      borderTop: `1px solid ${config.THEMES[currentMode].border}`,
+                      marginTop: '8px',
+                      paddingTop: '10px',
+                    },
+                  },
+                  window.preact.h(
                     'div',
                     {
                       style: {
                         alignItems: 'center',
                         display: 'flex',
-                        flex: 1,
+                        flexWrap: 'wrap',
                         justifyContent: 'space-between',
+                        rowGap: '4px',
                       },
                     },
                     window.preact.h(
-                      'button',
-                      {
-                        key: isScanning ? 'scanning-stop' : 'scanning-start',
-                        className: `panel-button ${isScanning ? '' : 'scanning-stopped'}`,
-                        onClick: onToggleScanning,
-                        'aria-label': isScanning
-                          ? 'Stop Scanning'
-                          : 'Start Scanning',
-                      },
-                      window.preact.h('i', {
-                        className: isScanning
-                          ? 'fa-solid fa-stop'
-                          : 'fa-solid fa-play',
-                        style: { marginRight: '12px' },
-                      }),
-                      'Scan'
+                      'span',
+                      { style: { fontWeight: 600 } },
+                      'Auto Delete'
                     ),
                     window.preact.h(
-                      'button',
-                      {
-                        key: isScrolling ? 'scroll-stop' : 'scroll-start',
-                        className: 'panel-button',
-                        onClick: onToggleAutoScrolling,
-                        'aria-label': isScrolling
-                          ? 'Stop Auto-Scroll'
-                          : 'Start Auto-Scroll',
-                      },
-                      window.preact.h('i', {
-                        className: isScrolling
-                          ? 'fa-solid fa-stop'
-                          : 'fa-solid fa-play',
-                        style: { marginRight: '12px' },
-                      }),
-                      'Scroll'
-                    ),
-                    window.preact.h(
-                      'button',
-                      {
-                        className: 'panel-button',
-                        onClick: onToggleVisibility,
-                        'aria-label': 'Hide Panel',
-                      },
-                      window.preact.h('i', {
-                        className: 'fas fa-eye-slash',
-                        style: { marginRight: '12px' },
-                      }),
-                      'Hide'
+                      'span',
+                      { style: { fontSize: '12px', opacity: 0.85 } },
+                      autoDeleteStatusLabel
                     )
+                  ),
+                  window.preact.h(
+                    'div',
+                    { style: { fontSize: '12px', opacity: 0.85 } },
+                    autoDeleteUsernameLabel
+                  ),
+                  window.preact.h(
+                    'div',
+                    { style: { fontSize: '12px', opacity: 0.85 } },
+                    autoDeleteCountLabel
+                  ),
+                  autoDelete.message
+                    ? window.preact.h(
+                        'div',
+                        { style: { fontSize: '12px', opacity: 0.85 } },
+                        autoDelete.message
+                      )
+                    : null,
+                  window.preact.h(
+                    'div',
+                    { style: { fontSize: '12px', opacity: 0.75 } },
+                    'Use the Auto Delete button above to start or stop.'
                   )
                 ),
                 window.preact.h(
@@ -2354,7 +2930,8 @@
                           style: { marginRight: '8px' },
                         }),
                         'About'
-                      )
+                      ),
+                      null
                     )
                   )
                 ),
@@ -2705,6 +3282,144 @@
     }
     window.SplashPanel = SplashPanel;
 
+    // src/config.js
+    var CONFIG = {
+      timing: {
+        debounceDelay: 500,
+        throttleDelay: 1e3,
+        tabCheckThrottle: 5e3,
+        exportThrottle: 5e3,
+        rateLimitPause: 20 * 1e3,
+        pollInterval: 500,
+        scrollInterval: 1500,
+        isPostScanningEnabledOnStartup: false,
+        // We'll send an event to change to true on the first heartbeat poll
+        userRequestedAutoScrollOnStartup: false,
+        checkPostMaxTries: 30,
+      },
+      showSplash: true,
+      logTarget: 'tampermonkey',
+      persistProcessedPosts: false,
+      linkPrefix: 'https://x.com',
+      debug: false,
+      smoothScrolling: true,
+      scrollPercentage: 1.5,
+      decoratePostsContainer: false,
+    };
+
+    // src/events.ts
+    var EVENTS = {
+      INIT_COMPONENTS: 'xghosted:init-components',
+      POST_REGISTERED: 'xghosted:post-registered',
+      POST_REQUESTED: 'xghosted:post-requested',
+      POST_RETRIEVED: 'xghosted:post-retrieved',
+      REQUEST_POST_CHECK: 'xghosted:request-post-check',
+      CLEAR_POSTS: 'xghosted:clear-posts',
+      CLEAR_POSTS_UI: 'xghosted:clear-posts-ui',
+      POSTS_CLEARED: 'xghosted:posts-cleared',
+      POSTS_CLEARED_CONFIRMED: 'xghosted:posts-cleared-confirmed',
+      REQUEST_POSTS: 'xghosted:request-posts',
+      POSTS_RETRIEVED: 'xghosted:posts-retrieved',
+      CSV_IMPORTED: 'xghosted:csv-imported',
+      REQUEST_IMPORT_CSV: 'xghosted:request-import-csv',
+      EXPORT_CSV: 'xghosted:export-csv',
+      CSV_EXPORTED: 'xghosted:csv-exported',
+      SET_SCANNING: 'xghosted:set-scanning',
+      SCANNING_STATE_UPDATED: 'xghosted:scanning-state-updated',
+      SET_AUTO_SCROLLING: 'xghosted:set-auto-scrolling',
+      AUTO_SCROLLING_TOGGLED: 'xghosted:auto-scrolling-toggled',
+      RATE_LIMIT_DETECTED: 'xghosted:rate-limit-detected',
+      USER_PROFILE_UPDATED: 'xghosted:user-profile-updated',
+      INIT: 'xghosted:init',
+      STATE_UPDATED: 'xghosted:state-updated',
+      OPEN_ABOUT: 'xghosted:open-about',
+      TOGGLE_PANEL_VISIBILITY: 'xghosted:toggle-panel-visibility',
+      COPY_LINKS: 'xghosted:copy-links',
+      REQUEST_METRICS: 'xghosted:request-metrics',
+      METRICS_RETRIEVED: 'xghosted:metrics-retrieved',
+      EXPORT_METRICS: 'xghosted:export-metrics',
+      METRICS_UPDATED: 'xghosted:metrics-updated',
+      RECORD_POLL: 'xghosted:record-poll',
+      RECORD_SCROLL: 'xghosted:record-scroll',
+      RECORD_SCAN: 'xghosted:record-scan',
+      RECORD_TAB_CHECK: 'xghosted:record-tab-check',
+      SET_INITIAL_WAIT_TIME: 'xghosted:set-initial-wait-time',
+      SET_POST_DENSITY: 'xghosted:set-post-density',
+      SAVE_METRICS: 'xghosted:save-metrics',
+      AUTO_DELETE_TOGGLE_REQUEST: 'xghosted:auto-delete-toggle-request',
+      AUTO_DELETE_STATUS: 'xghosted:auto-delete-status',
+    };
+    var EVENT_CONTRACTS = {
+      [EVENTS.INIT_COMPONENTS]: { config: 'object' },
+      [EVENTS.POST_REGISTERED]: { href: 'string', data: 'object' },
+      [EVENTS.POST_REQUESTED]: { href: 'string' },
+      [EVENTS.POST_RETRIEVED]: { href: 'string', post: 'object|null' },
+      [EVENTS.REQUEST_POST_CHECK]: { href: 'string' },
+      [EVENTS.CLEAR_POSTS]: {},
+      [EVENTS.CLEAR_POSTS_UI]: {},
+      [EVENTS.POSTS_CLEARED]: {},
+      [EVENTS.POSTS_CLEARED_CONFIRMED]: {},
+      [EVENTS.REQUEST_POSTS]: {},
+      [EVENTS.POSTS_RETRIEVED]: { posts: 'array' },
+      [EVENTS.CSV_IMPORTED]: { importedCount: 'number' },
+      [EVENTS.REQUEST_IMPORT_CSV]: { csvText: 'string' },
+      [EVENTS.EXPORT_CSV]: {},
+      [EVENTS.CSV_EXPORTED]: { csvData: 'string' },
+      [EVENTS.SET_SCANNING]: { enabled: 'boolean' },
+      [EVENTS.SCANNING_STATE_UPDATED]: { isPostScanningEnabled: 'boolean' },
+      [EVENTS.SET_AUTO_SCROLLING]: { enabled: 'boolean' },
+      [EVENTS.AUTO_SCROLLING_TOGGLED]: {
+        userRequestedAutoScrolling: 'boolean',
+      },
+      [EVENTS.RATE_LIMIT_DETECTED]: { pauseDuration: 'number' },
+      [EVENTS.USER_PROFILE_UPDATED]: { userProfileName: 'string|null' },
+      [EVENTS.INIT]: { config: 'object' },
+      [EVENTS.STATE_UPDATED]: { isRateLimited: 'boolean' },
+      [EVENTS.OPEN_ABOUT]: {},
+      [EVENTS.TOGGLE_PANEL_VISIBILITY]: { isPanelVisible: 'boolean' },
+      [EVENTS.COPY_LINKS]: {},
+      [EVENTS.REQUEST_METRICS]: {},
+      [EVENTS.METRICS_RETRIEVED]: { timingHistory: 'array' },
+      [EVENTS.EXPORT_METRICS]: {},
+      [EVENTS.METRICS_UPDATED]: { metrics: 'object' },
+      [EVENTS.RECORD_POLL]: {
+        postsProcessed: 'number',
+        wasSkipped: 'boolean',
+        containerFound: 'boolean',
+        containerAttempted: 'boolean',
+        pageType: 'string',
+        isScanningStarted: 'boolean',
+        isScanningStopped: 'boolean',
+        cellInnerDivCount: 'number',
+      },
+      [EVENTS.RECORD_SCROLL]: { bottomReached: 'boolean' },
+      [EVENTS.RECORD_SCAN]: {
+        duration: 'number',
+        postsProcessed: 'number',
+        wasSkipped: 'boolean',
+        interval: 'number',
+        isAutoScrolling: 'boolean',
+      },
+      [EVENTS.RECORD_TAB_CHECK]: {
+        duration: 'number',
+        success: 'boolean',
+        rateLimited: 'boolean',
+        attempts: 'number',
+      },
+      [EVENTS.SET_INITIAL_WAIT_TIME]: { time: 'number' },
+      [EVENTS.SET_POST_DENSITY]: { count: 'number' },
+      [EVENTS.SAVE_METRICS]: {},
+      [EVENTS.AUTO_DELETE_TOGGLE_REQUEST]: { enabled: 'boolean' },
+      [EVENTS.AUTO_DELETE_STATUS]: {
+        running: 'boolean',
+        deleting: 'boolean',
+        deletedCount: 'number',
+        username: 'string|null',
+        canRun: 'boolean',
+        message: 'string',
+      },
+    };
+
     // src/ui/PanelManager.js
     window.PanelManager = function (
       doc,
@@ -2742,6 +3457,14 @@
         pendingImportCount: null,
         isSplashDragging: false,
         splashPosition: { top: null, left: null },
+        autoDeleteStatus: {
+          running: false,
+          deleting: false,
+          deletedCount: 0,
+          username: null,
+          canRun: false,
+          message: 'Open your /with_replies page to enable auto delete.',
+        },
       };
       this.log(
         `PanelManager initialized with themeMode: ${this.state.themeMode}`
@@ -3024,6 +3747,18 @@
         URL.revokeObjectURL(url);
         this.log(`Exported CSV: processed_posts.csv`);
       };
+      const handleAutoDeleteStatus = (e) => {
+        const detail = e.detail || {};
+        this.state.autoDeleteStatus = {
+          running: Boolean(detail.running),
+          deleting: Boolean(detail.deleting),
+          deletedCount: detail.deletedCount ?? 0,
+          username: detail.username || null,
+          canRun: Boolean(detail.canRun),
+          message: detail.message || '',
+        };
+        this.renderPanelDebounced();
+      };
       this.document.addEventListener(
         EVENTS.INIT_COMPONENTS,
         ({ detail: { config } }) => {
@@ -3073,6 +3808,10 @@
         handleMetricsRetrieved
       );
       this.document.addEventListener(EVENTS.CSV_EXPORTED, handleCsvExported);
+      this.document.addEventListener(
+        EVENTS.AUTO_DELETE_STATUS,
+        handleAutoDeleteStatus
+      );
       this.cleanup = () => {
         this.document.removeEventListener(
           EVENTS.STATE_UPDATED,
@@ -3127,6 +3866,10 @@
         this.document.removeEventListener(
           EVENTS.CSV_EXPORTED,
           handleCsvExported
+        );
+        this.document.removeEventListener(
+          EVENTS.AUTO_DELETE_STATUS,
+          handleAutoDeleteStatus
         );
       };
       this.renderPanelDebounced = this.debounce(() => this.renderPanel(), 500);
@@ -3342,6 +4085,8 @@
           onClearPosts: () => this.clearPosts(),
           onOpenAbout: () => this.openAbout(),
           onToggleDropdown: () => this.toggleDropdown(),
+          autoDeleteStatus: this.state.autoDeleteStatus,
+          onToggleAutoDelete: () => this.toggleAutoDelete(),
         }),
         this.uiElements.panel
       );
@@ -3563,6 +4308,18 @@
         `Toggled auto-scrolling: ${!this.state.userRequestedAutoScrolling}`
       );
     };
+    window.PanelManager.prototype.toggleAutoDelete = function () {
+      const running = Boolean(this.state.autoDeleteStatus?.running);
+      const nextState = !running;
+      this.log(
+        `PanelManager: Auto delete toggle requested -> ${nextState ? 'start' : 'stop'}`
+      );
+      this.document.dispatchEvent(
+        new CustomEvent(EVENTS.AUTO_DELETE_TOGGLE_REQUEST, {
+          detail: { enabled: nextState },
+        })
+      );
+    };
     window.PanelManager.prototype.exportCsv = function () {
       this.pendingExportCsv = true;
       this.document.dispatchEvent(new CustomEvent(EVENTS.EXPORT_CSV));
@@ -3653,7 +4410,199 @@
     return PanelManager;
   })();
   window.ProcessedPostsManager = (function () {
-    const { postQuality, CONFIG, EVENTS, domUtils } = window.XGhostedUtils;
+    // src/utils/postQuality.js
+    var postQuality = Object.freeze({
+      UNDEFINED: Object.freeze({ name: 'Undefined Container', value: 0 }),
+      DIVIDER: Object.freeze({ name: 'Invisible Divider', value: 1 }),
+      PROBLEM: Object.freeze({ name: 'Problem', value: 2 }),
+      PROBLEM_ADJACENT: Object.freeze({
+        name: 'Problem by Association',
+        value: 3,
+      }),
+      POTENTIAL_PROBLEM: Object.freeze({ name: 'Potential Problem', value: 4 }),
+      GOOD: Object.freeze({ name: 'Good', value: 5 }),
+    });
+
+    // src/config.js
+    var CONFIG = {
+      timing: {
+        debounceDelay: 500,
+        throttleDelay: 1e3,
+        tabCheckThrottle: 5e3,
+        exportThrottle: 5e3,
+        rateLimitPause: 20 * 1e3,
+        pollInterval: 500,
+        scrollInterval: 1500,
+        isPostScanningEnabledOnStartup: false,
+        // We'll send an event to change to true on the first heartbeat poll
+        userRequestedAutoScrollOnStartup: false,
+        checkPostMaxTries: 30,
+      },
+      showSplash: true,
+      logTarget: 'tampermonkey',
+      persistProcessedPosts: false,
+      linkPrefix: 'https://x.com',
+      debug: false,
+      smoothScrolling: true,
+      scrollPercentage: 1.5,
+      decoratePostsContainer: false,
+    };
+
+    // src/events.ts
+    var EVENTS = {
+      INIT_COMPONENTS: 'xghosted:init-components',
+      POST_REGISTERED: 'xghosted:post-registered',
+      POST_REQUESTED: 'xghosted:post-requested',
+      POST_RETRIEVED: 'xghosted:post-retrieved',
+      REQUEST_POST_CHECK: 'xghosted:request-post-check',
+      CLEAR_POSTS: 'xghosted:clear-posts',
+      CLEAR_POSTS_UI: 'xghosted:clear-posts-ui',
+      POSTS_CLEARED: 'xghosted:posts-cleared',
+      POSTS_CLEARED_CONFIRMED: 'xghosted:posts-cleared-confirmed',
+      REQUEST_POSTS: 'xghosted:request-posts',
+      POSTS_RETRIEVED: 'xghosted:posts-retrieved',
+      CSV_IMPORTED: 'xghosted:csv-imported',
+      REQUEST_IMPORT_CSV: 'xghosted:request-import-csv',
+      EXPORT_CSV: 'xghosted:export-csv',
+      CSV_EXPORTED: 'xghosted:csv-exported',
+      SET_SCANNING: 'xghosted:set-scanning',
+      SCANNING_STATE_UPDATED: 'xghosted:scanning-state-updated',
+      SET_AUTO_SCROLLING: 'xghosted:set-auto-scrolling',
+      AUTO_SCROLLING_TOGGLED: 'xghosted:auto-scrolling-toggled',
+      RATE_LIMIT_DETECTED: 'xghosted:rate-limit-detected',
+      USER_PROFILE_UPDATED: 'xghosted:user-profile-updated',
+      INIT: 'xghosted:init',
+      STATE_UPDATED: 'xghosted:state-updated',
+      OPEN_ABOUT: 'xghosted:open-about',
+      TOGGLE_PANEL_VISIBILITY: 'xghosted:toggle-panel-visibility',
+      COPY_LINKS: 'xghosted:copy-links',
+      REQUEST_METRICS: 'xghosted:request-metrics',
+      METRICS_RETRIEVED: 'xghosted:metrics-retrieved',
+      EXPORT_METRICS: 'xghosted:export-metrics',
+      METRICS_UPDATED: 'xghosted:metrics-updated',
+      RECORD_POLL: 'xghosted:record-poll',
+      RECORD_SCROLL: 'xghosted:record-scroll',
+      RECORD_SCAN: 'xghosted:record-scan',
+      RECORD_TAB_CHECK: 'xghosted:record-tab-check',
+      SET_INITIAL_WAIT_TIME: 'xghosted:set-initial-wait-time',
+      SET_POST_DENSITY: 'xghosted:set-post-density',
+      SAVE_METRICS: 'xghosted:save-metrics',
+      AUTO_DELETE_TOGGLE_REQUEST: 'xghosted:auto-delete-toggle-request',
+      AUTO_DELETE_STATUS: 'xghosted:auto-delete-status',
+    };
+    var EVENT_CONTRACTS = {
+      [EVENTS.INIT_COMPONENTS]: { config: 'object' },
+      [EVENTS.POST_REGISTERED]: { href: 'string', data: 'object' },
+      [EVENTS.POST_REQUESTED]: { href: 'string' },
+      [EVENTS.POST_RETRIEVED]: { href: 'string', post: 'object|null' },
+      [EVENTS.REQUEST_POST_CHECK]: { href: 'string' },
+      [EVENTS.CLEAR_POSTS]: {},
+      [EVENTS.CLEAR_POSTS_UI]: {},
+      [EVENTS.POSTS_CLEARED]: {},
+      [EVENTS.POSTS_CLEARED_CONFIRMED]: {},
+      [EVENTS.REQUEST_POSTS]: {},
+      [EVENTS.POSTS_RETRIEVED]: { posts: 'array' },
+      [EVENTS.CSV_IMPORTED]: { importedCount: 'number' },
+      [EVENTS.REQUEST_IMPORT_CSV]: { csvText: 'string' },
+      [EVENTS.EXPORT_CSV]: {},
+      [EVENTS.CSV_EXPORTED]: { csvData: 'string' },
+      [EVENTS.SET_SCANNING]: { enabled: 'boolean' },
+      [EVENTS.SCANNING_STATE_UPDATED]: { isPostScanningEnabled: 'boolean' },
+      [EVENTS.SET_AUTO_SCROLLING]: { enabled: 'boolean' },
+      [EVENTS.AUTO_SCROLLING_TOGGLED]: {
+        userRequestedAutoScrolling: 'boolean',
+      },
+      [EVENTS.RATE_LIMIT_DETECTED]: { pauseDuration: 'number' },
+      [EVENTS.USER_PROFILE_UPDATED]: { userProfileName: 'string|null' },
+      [EVENTS.INIT]: { config: 'object' },
+      [EVENTS.STATE_UPDATED]: { isRateLimited: 'boolean' },
+      [EVENTS.OPEN_ABOUT]: {},
+      [EVENTS.TOGGLE_PANEL_VISIBILITY]: { isPanelVisible: 'boolean' },
+      [EVENTS.COPY_LINKS]: {},
+      [EVENTS.REQUEST_METRICS]: {},
+      [EVENTS.METRICS_RETRIEVED]: { timingHistory: 'array' },
+      [EVENTS.EXPORT_METRICS]: {},
+      [EVENTS.METRICS_UPDATED]: { metrics: 'object' },
+      [EVENTS.RECORD_POLL]: {
+        postsProcessed: 'number',
+        wasSkipped: 'boolean',
+        containerFound: 'boolean',
+        containerAttempted: 'boolean',
+        pageType: 'string',
+        isScanningStarted: 'boolean',
+        isScanningStopped: 'boolean',
+        cellInnerDivCount: 'number',
+      },
+      [EVENTS.RECORD_SCROLL]: { bottomReached: 'boolean' },
+      [EVENTS.RECORD_SCAN]: {
+        duration: 'number',
+        postsProcessed: 'number',
+        wasSkipped: 'boolean',
+        interval: 'number',
+        isAutoScrolling: 'boolean',
+      },
+      [EVENTS.RECORD_TAB_CHECK]: {
+        duration: 'number',
+        success: 'boolean',
+        rateLimited: 'boolean',
+        attempts: 'number',
+      },
+      [EVENTS.SET_INITIAL_WAIT_TIME]: { time: 'number' },
+      [EVENTS.SET_POST_DENSITY]: { count: 'number' },
+      [EVENTS.SAVE_METRICS]: {},
+      [EVENTS.AUTO_DELETE_TOGGLE_REQUEST]: { enabled: 'boolean' },
+      [EVENTS.AUTO_DELETE_STATUS]: {
+        running: 'boolean',
+        deleting: 'boolean',
+        deletedCount: 'number',
+        username: 'string|null',
+        canRun: 'boolean',
+        message: 'string',
+      },
+    };
+
+    // src/dom/domUtils.js
+    var domUtils = {
+      querySelector(selector, doc = document) {
+        return doc.querySelector(selector);
+      },
+      querySelectorAll(selector, doc = document) {
+        return doc.querySelectorAll(selector);
+      },
+      createElement(tag, doc = document) {
+        return doc.createElement(tag);
+      },
+      addEventListener(element, event, handler, options = {}) {
+        element.addEventListener(event, handler, options);
+      },
+      dispatchEvent(element, event) {
+        element.dispatchEvent(event);
+      },
+      removeEventListener(element, event, handler, options = {}) {
+        element.removeEventListener(event, handler, options);
+      },
+      closest(element, selector) {
+        let current = element;
+        while (current && !current.matches(selector)) {
+          current = current.parentElement;
+        }
+        return current;
+      },
+      scrollBy(options, win = window) {
+        win.scrollBy(options);
+      },
+      getScrollY(win = window) {
+        return win.scrollY;
+      },
+      getInnerHeight(win = window) {
+        return win.innerHeight;
+      },
+      POSTS_IN_DOC_SELECTOR: `div:not([aria-label="Timeline: Messages"]) > div > div[data-testid="cellInnerDiv"]`,
+      POST_CONTAINER_SELECTOR: 'div[data-ghosted="posts-container"]',
+      POSTS_IN_CONTAINER_SELECTOR: `div[data-ghosted="posts-container"] > div > div[data-testid="cellInnerDiv"]`,
+      UNPROCESSED_POSTS_SELECTOR: `div[data-ghosted="posts-container"] > div > div[data-testid="cellInnerDiv"]:not([data-ghostedid])`,
+    };
+
     // src/utils/ProcessedPostsManager.js
     var ProcessedPostsManager = class {
       constructor({
@@ -3661,7 +4610,7 @@
         log,
         linkPrefix,
         persistProcessedPosts,
-        document,
+        document: document2,
       }) {
         this.storage = storage || { get: () => {}, set: () => {} };
         this.log = log || console.log.bind(console);
@@ -3669,7 +4618,7 @@
         this.persistProcessedPosts =
           persistProcessedPosts ?? CONFIG.persistProcessedPosts;
         this.posts = {};
-        this.document = document;
+        this.document = document2;
         if (this.persistProcessedPosts) {
           this.load();
         }
@@ -3957,14 +4906,193 @@
     return ProcessedPostsManager;
   })();
   window.MetricsMonitor = (function () {
-    const { CONFIG, EVENTS, domUtils } = window.XGhostedUtils;
+    // src/config.js
+    var CONFIG = {
+      timing: {
+        debounceDelay: 500,
+        throttleDelay: 1e3,
+        tabCheckThrottle: 5e3,
+        exportThrottle: 5e3,
+        rateLimitPause: 20 * 1e3,
+        pollInterval: 500,
+        scrollInterval: 1500,
+        isPostScanningEnabledOnStartup: false,
+        // We'll send an event to change to true on the first heartbeat poll
+        userRequestedAutoScrollOnStartup: false,
+        checkPostMaxTries: 30,
+      },
+      showSplash: true,
+      logTarget: 'tampermonkey',
+      persistProcessedPosts: false,
+      linkPrefix: 'https://x.com',
+      debug: false,
+      smoothScrolling: true,
+      scrollPercentage: 1.5,
+      decoratePostsContainer: false,
+    };
+
+    // src/events.ts
+    var EVENTS = {
+      INIT_COMPONENTS: 'xghosted:init-components',
+      POST_REGISTERED: 'xghosted:post-registered',
+      POST_REQUESTED: 'xghosted:post-requested',
+      POST_RETRIEVED: 'xghosted:post-retrieved',
+      REQUEST_POST_CHECK: 'xghosted:request-post-check',
+      CLEAR_POSTS: 'xghosted:clear-posts',
+      CLEAR_POSTS_UI: 'xghosted:clear-posts-ui',
+      POSTS_CLEARED: 'xghosted:posts-cleared',
+      POSTS_CLEARED_CONFIRMED: 'xghosted:posts-cleared-confirmed',
+      REQUEST_POSTS: 'xghosted:request-posts',
+      POSTS_RETRIEVED: 'xghosted:posts-retrieved',
+      CSV_IMPORTED: 'xghosted:csv-imported',
+      REQUEST_IMPORT_CSV: 'xghosted:request-import-csv',
+      EXPORT_CSV: 'xghosted:export-csv',
+      CSV_EXPORTED: 'xghosted:csv-exported',
+      SET_SCANNING: 'xghosted:set-scanning',
+      SCANNING_STATE_UPDATED: 'xghosted:scanning-state-updated',
+      SET_AUTO_SCROLLING: 'xghosted:set-auto-scrolling',
+      AUTO_SCROLLING_TOGGLED: 'xghosted:auto-scrolling-toggled',
+      RATE_LIMIT_DETECTED: 'xghosted:rate-limit-detected',
+      USER_PROFILE_UPDATED: 'xghosted:user-profile-updated',
+      INIT: 'xghosted:init',
+      STATE_UPDATED: 'xghosted:state-updated',
+      OPEN_ABOUT: 'xghosted:open-about',
+      TOGGLE_PANEL_VISIBILITY: 'xghosted:toggle-panel-visibility',
+      COPY_LINKS: 'xghosted:copy-links',
+      REQUEST_METRICS: 'xghosted:request-metrics',
+      METRICS_RETRIEVED: 'xghosted:metrics-retrieved',
+      EXPORT_METRICS: 'xghosted:export-metrics',
+      METRICS_UPDATED: 'xghosted:metrics-updated',
+      RECORD_POLL: 'xghosted:record-poll',
+      RECORD_SCROLL: 'xghosted:record-scroll',
+      RECORD_SCAN: 'xghosted:record-scan',
+      RECORD_TAB_CHECK: 'xghosted:record-tab-check',
+      SET_INITIAL_WAIT_TIME: 'xghosted:set-initial-wait-time',
+      SET_POST_DENSITY: 'xghosted:set-post-density',
+      SAVE_METRICS: 'xghosted:save-metrics',
+      AUTO_DELETE_TOGGLE_REQUEST: 'xghosted:auto-delete-toggle-request',
+      AUTO_DELETE_STATUS: 'xghosted:auto-delete-status',
+    };
+    var EVENT_CONTRACTS = {
+      [EVENTS.INIT_COMPONENTS]: { config: 'object' },
+      [EVENTS.POST_REGISTERED]: { href: 'string', data: 'object' },
+      [EVENTS.POST_REQUESTED]: { href: 'string' },
+      [EVENTS.POST_RETRIEVED]: { href: 'string', post: 'object|null' },
+      [EVENTS.REQUEST_POST_CHECK]: { href: 'string' },
+      [EVENTS.CLEAR_POSTS]: {},
+      [EVENTS.CLEAR_POSTS_UI]: {},
+      [EVENTS.POSTS_CLEARED]: {},
+      [EVENTS.POSTS_CLEARED_CONFIRMED]: {},
+      [EVENTS.REQUEST_POSTS]: {},
+      [EVENTS.POSTS_RETRIEVED]: { posts: 'array' },
+      [EVENTS.CSV_IMPORTED]: { importedCount: 'number' },
+      [EVENTS.REQUEST_IMPORT_CSV]: { csvText: 'string' },
+      [EVENTS.EXPORT_CSV]: {},
+      [EVENTS.CSV_EXPORTED]: { csvData: 'string' },
+      [EVENTS.SET_SCANNING]: { enabled: 'boolean' },
+      [EVENTS.SCANNING_STATE_UPDATED]: { isPostScanningEnabled: 'boolean' },
+      [EVENTS.SET_AUTO_SCROLLING]: { enabled: 'boolean' },
+      [EVENTS.AUTO_SCROLLING_TOGGLED]: {
+        userRequestedAutoScrolling: 'boolean',
+      },
+      [EVENTS.RATE_LIMIT_DETECTED]: { pauseDuration: 'number' },
+      [EVENTS.USER_PROFILE_UPDATED]: { userProfileName: 'string|null' },
+      [EVENTS.INIT]: { config: 'object' },
+      [EVENTS.STATE_UPDATED]: { isRateLimited: 'boolean' },
+      [EVENTS.OPEN_ABOUT]: {},
+      [EVENTS.TOGGLE_PANEL_VISIBILITY]: { isPanelVisible: 'boolean' },
+      [EVENTS.COPY_LINKS]: {},
+      [EVENTS.REQUEST_METRICS]: {},
+      [EVENTS.METRICS_RETRIEVED]: { timingHistory: 'array' },
+      [EVENTS.EXPORT_METRICS]: {},
+      [EVENTS.METRICS_UPDATED]: { metrics: 'object' },
+      [EVENTS.RECORD_POLL]: {
+        postsProcessed: 'number',
+        wasSkipped: 'boolean',
+        containerFound: 'boolean',
+        containerAttempted: 'boolean',
+        pageType: 'string',
+        isScanningStarted: 'boolean',
+        isScanningStopped: 'boolean',
+        cellInnerDivCount: 'number',
+      },
+      [EVENTS.RECORD_SCROLL]: { bottomReached: 'boolean' },
+      [EVENTS.RECORD_SCAN]: {
+        duration: 'number',
+        postsProcessed: 'number',
+        wasSkipped: 'boolean',
+        interval: 'number',
+        isAutoScrolling: 'boolean',
+      },
+      [EVENTS.RECORD_TAB_CHECK]: {
+        duration: 'number',
+        success: 'boolean',
+        rateLimited: 'boolean',
+        attempts: 'number',
+      },
+      [EVENTS.SET_INITIAL_WAIT_TIME]: { time: 'number' },
+      [EVENTS.SET_POST_DENSITY]: { count: 'number' },
+      [EVENTS.SAVE_METRICS]: {},
+      [EVENTS.AUTO_DELETE_TOGGLE_REQUEST]: { enabled: 'boolean' },
+      [EVENTS.AUTO_DELETE_STATUS]: {
+        running: 'boolean',
+        deleting: 'boolean',
+        deletedCount: 'number',
+        username: 'string|null',
+        canRun: 'boolean',
+        message: 'string',
+      },
+    };
+
+    // src/dom/domUtils.js
+    var domUtils = {
+      querySelector(selector, doc = document) {
+        return doc.querySelector(selector);
+      },
+      querySelectorAll(selector, doc = document) {
+        return doc.querySelectorAll(selector);
+      },
+      createElement(tag, doc = document) {
+        return doc.createElement(tag);
+      },
+      addEventListener(element, event, handler, options = {}) {
+        element.addEventListener(event, handler, options);
+      },
+      dispatchEvent(element, event) {
+        element.dispatchEvent(event);
+      },
+      removeEventListener(element, event, handler, options = {}) {
+        element.removeEventListener(event, handler, options);
+      },
+      closest(element, selector) {
+        let current = element;
+        while (current && !current.matches(selector)) {
+          current = current.parentElement;
+        }
+        return current;
+      },
+      scrollBy(options, win = window) {
+        win.scrollBy(options);
+      },
+      getScrollY(win = window) {
+        return win.scrollY;
+      },
+      getInnerHeight(win = window) {
+        return win.innerHeight;
+      },
+      POSTS_IN_DOC_SELECTOR: `div:not([aria-label="Timeline: Messages"]) > div > div[data-testid="cellInnerDiv"]`,
+      POST_CONTAINER_SELECTOR: 'div[data-ghosted="posts-container"]',
+      POSTS_IN_CONTAINER_SELECTOR: `div[data-ghosted="posts-container"] > div > div[data-testid="cellInnerDiv"]`,
+      UNPROCESSED_POSTS_SELECTOR: `div[data-ghosted="posts-container"] > div > div[data-testid="cellInnerDiv"]:not([data-ghostedid])`,
+    };
+
     // src/utils/MetricsMonitor.js
     var MetricsMonitor = class {
-      constructor({ timing, log, storage, document }) {
+      constructor({ timing, log, storage, document: document2 }) {
         this.timing = { ...CONFIG.timing, ...timing };
         this.log = log || console.log.bind(console);
         this.storage = storage || { get: () => {}, set: () => {} };
-        this.document = document;
+        this.document = document2;
         this.startTime = performance.now();
         this.metrics = {
           totalPolls: 0,

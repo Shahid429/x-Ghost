@@ -23,10 +23,30 @@ function Panel({
   onClearPosts,
   onOpenAbout,
   onToggleDropdown,
+  autoDeleteStatus,
+  onToggleAutoDelete,
 }) {
   const themeOptions = ['dark', 'dim', 'light'].filter(
     (option) => option !== currentMode
   );
+  const autoDelete = autoDeleteStatus || {};
+  const autoDeleteButtonLabel = autoDelete.running
+    ? 'Stop Auto Delete'
+    : 'Start Auto Delete';
+  const autoDeleteStatusLabel = autoDelete.deleting
+    ? 'Deleting…'
+    : autoDelete.running
+      ? 'Running'
+      : autoDelete.canRun
+        ? 'Ready'
+        : 'Unavailable';
+  const autoDeleteUsernameLabel = autoDelete.username
+    ? `@${autoDelete.username}`
+    : 'Username not detected';
+  const autoDeleteCountLabel = `Deleted ${autoDelete.deletedCount || 0}`;
+  const autoDeleteDisabled = !autoDelete.running && !autoDelete.canRun;
+  const autoDeleteIcon = autoDelete.running ? 'fa-solid fa-stop' : 'fa-solid fa-play';
+  const toolbarButtonStyle = { flex: '1 1 120px', minWidth: '100px' };
 
   return window.preact.h(
     'div',
@@ -55,7 +75,14 @@ function Panel({
           null,
           window.preact.h(
             'div',
-            { className: 'toolbar' },
+            {
+              className: 'toolbar',
+              style: {
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: '8px',
+              },
+            },
             window.preact.h(
               'button',
               {
@@ -65,6 +92,7 @@ function Panel({
                 className: 'panel-button',
                 onClick: onToggleTools,
                 'aria-label': 'Toggle Tools Section',
+                style: toolbarButtonStyle,
               },
               window.preact.h('i', {
                 className: state.isToolsExpanded
@@ -75,64 +103,132 @@ function Panel({
               'Tools'
             ),
             window.preact.h(
+              'button',
+              {
+                key: isScanning ? 'scanning-stop' : 'scanning-start',
+                className: `panel-button ${isScanning ? '' : 'scanning-stopped'}`,
+                onClick: onToggleScanning,
+                'aria-label': isScanning
+                  ? 'Stop Scanning'
+                  : 'Start Scanning',
+                style: toolbarButtonStyle,
+              },
+              window.preact.h('i', {
+                className: isScanning
+                  ? 'fa-solid fa-stop'
+                  : 'fa-solid fa-play',
+                style: { marginRight: '12px' },
+              }),
+              'Scan'
+            ),
+            window.preact.h(
+              'button',
+              {
+                key: isScrolling ? 'scroll-stop' : 'scroll-start',
+                className: 'panel-button',
+                onClick: onToggleAutoScrolling,
+                'aria-label': isScrolling
+                  ? 'Stop Auto-Scroll'
+                  : 'Start Auto-Scroll',
+                style: toolbarButtonStyle,
+              },
+              window.preact.h('i', {
+                className: isScrolling
+                  ? 'fa-solid fa-stop'
+                  : 'fa-solid fa-play',
+                style: { marginRight: '12px' },
+              }),
+              'Scroll'
+            ),
+            window.preact.h(
+              'button',
+              {
+                key: autoDelete.running ? 'autodelete-stop' : 'autodelete-start',
+                className: 'panel-button',
+                onClick: onToggleAutoDelete,
+                'aria-label': autoDeleteButtonLabel,
+                title: autoDeleteStatusLabel,
+                disabled: autoDeleteDisabled,
+                style: {
+                  ...toolbarButtonStyle,
+                  ...(autoDeleteDisabled
+                    ? { opacity: 0.5, cursor: 'not-allowed' }
+                    : {}),
+                },
+              },
+              window.preact.h('i', {
+                className: autoDeleteIcon,
+                style: { marginRight: '12px' },
+              }),
+              'Delete'
+            ),
+            window.preact.h(
+              'button',
+              {
+                className: 'panel-button',
+                onClick: onToggleVisibility,
+                'aria-label': 'Hide Panel',
+                style: toolbarButtonStyle,
+              },
+              window.preact.h('i', {
+                className: 'fas fa-eye-slash',
+                style: { marginRight: '12px' },
+              }),
+              'Hide'
+            )
+          ),
+          window.preact.h(
+            'div',
+            {
+              style: {
+                borderTop: `1px solid ${config.THEMES[currentMode].border}`,
+                marginTop: '8px',
+                paddingTop: '10px',
+              },
+            },
+            window.preact.h(
               'div',
               {
                 style: {
                   alignItems: 'center',
                   display: 'flex',
-                  flex: 1,
+                  flexWrap: 'wrap',
                   justifyContent: 'space-between',
+                  rowGap: '4px',
                 },
               },
               window.preact.h(
-                'button',
-                {
-                  key: isScanning ? 'scanning-stop' : 'scanning-start',
-                  className: `panel-button ${isScanning ? '' : 'scanning-stopped'}`,
-                  onClick: onToggleScanning,
-                  'aria-label': isScanning
-                    ? 'Stop Scanning'
-                    : 'Start Scanning',
-                },
-                window.preact.h('i', {
-                  className: isScanning
-                    ? 'fa-solid fa-stop'
-                    : 'fa-solid fa-play',
-                  style: { marginRight: '12px' },
-                }),
-                'Scan'
+                'span',
+                { style: { fontWeight: 600 } },
+                'Auto Delete'
               ),
               window.preact.h(
-                'button',
-                {
-                  key: isScrolling ? 'scroll-stop' : 'scroll-start',
-                  className: 'panel-button',
-                  onClick: onToggleAutoScrolling,
-                  'aria-label': isScrolling
-                    ? 'Stop Auto-Scroll'
-                    : 'Start Auto-Scroll',
-                },
-                window.preact.h('i', {
-                  className: isScrolling
-                    ? 'fa-solid fa-stop'
-                    : 'fa-solid fa-play',
-                  style: { marginRight: '12px' },
-                }),
-                'Scroll'
-              ),
-              window.preact.h(
-                'button',
-                {
-                  className: 'panel-button',
-                  onClick: onToggleVisibility,
-                  'aria-label': 'Hide Panel',
-                },
-                window.preact.h('i', {
-                  className: 'fas fa-eye-slash',
-                  style: { marginRight: '12px' },
-                }),
-                'Hide'
+                'span',
+                { style: { fontSize: '12px', opacity: 0.85 } },
+                autoDeleteStatusLabel
               )
+            ),
+            window.preact.h(
+              'div',
+              { style: { fontSize: '12px', opacity: 0.85 } },
+              autoDeleteUsernameLabel
+            ),
+            window.preact.h(
+              'div',
+              { style: { fontSize: '12px', opacity: 0.85 } },
+              autoDeleteCountLabel
+            ),
+            autoDelete.message
+              ? window.preact.h(
+                  'div',
+                  { style: { fontSize: '12px', opacity: 0.85 } },
+                  autoDelete.message
+                )
+              : null,
+            window.preact.h(
+              'div',
+              { style: { fontSize: '12px', opacity: 0.75 } },
+              'Use the Auto Delete button above to start or stop.'
             )
           ),
           window.preact.h(
@@ -299,7 +395,8 @@ function Panel({
                     style: { marginRight: '8px' },
                   }),
                   'About'
-                )
+                ),
+                null
               )
             )
           ),

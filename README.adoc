@@ -1,16 +1,64 @@
 = xGhosted: Keep Your X Presence Clean!
 
-xGhosted is a Tampermonkey userscript designed to help X users spot and manage “hanging chads”—lingering replies tied to deleted or problematic posts that might flag your account as low-quality, reducing visibility. With xGhosted, you can easily identify problem posts, check reply threads, and export your findings to stay in control of your X presence.
+xGhosted is a Tampermonkey userscript that helps you hunt down "hanging chads" on X—replies tied to deleted, hidden, or otherwise problematic posts that can drag down account quality. The script scans reply threads, surfaces risky posts, and bundles tools like Auto Delete, CSV export, and diagnostics so you stay in control of your visibility.
 
-== Key Features
-- *Spot Issues Instantly*: Highlights problematic posts (e.g., unavailable, deleted, or flagged content).  
-- *Check Reply Threads*: Dig deeper into suspicious replies with a single click.  
-- *Export Data*: Save your findings as a CSV for easy tracking.  
-- *User-Friendly Panel*: Manage everything via a draggable, resizable interface.
+== Highlights
+* *Instant Post Triage* – Flagged replies are tagged inline with clear severity indicators.
+* *Thread Context* – Jump from a reply to its parent chain without losing your place.
+* *Auto Delete* – Automatically remove flagged replies from your own `/with_replies` timeline.
+* *Exports & Metrics* – Copy suspect URLs or export full CSV data for audits.
+* *Panel Controls* – A draggable, theme-aware control panel keeps every action one click away.
 
-== Get Started
-1. Install the link:https://www.tampermonkey.net[Tampermonkey browser extension].  
-2. Grab xGhosted from our link:https://github.com/ajw1970/X-Ghosted/raw/refs/heads/main/src/xGhosted.user.js[GitHub repository].  
-3. Explore the link:docs/details.adoc[detailed guide] for setup tips, examples, and tutorials.  
+== Install The Published Userscript (Most Users)
+1. Install link:https://www.tampermonkey.net[Tampermonkey] for your browser.
+2. Open the latest built script: https://github.com/ajw1970/X-Ghosted/raw/main/src/xGhosted.user.js
+3. Tampermonkey prompts you to review the code. Click *Install*.
+4. Visit any X page. The xGhosted panel appears in the lower-right corner and begins scanning when you press *Scan*.
 
-Join the link:https://x.com/i/communities/1891057939835666756[Ghostbanned on X Community] for updates and support. Keep your X account clean with xGhosted!
+Need usage tips? The link:docs/details.adoc[detailed guide] walks through workflows, screenshots, and troubleshooting steps.
+
+== Develop Or Build Locally
+
+=== Prerequisites
+* Node.js 20 LTS (or newer) and npm 10+
+* Git
+* A modern browser with Tampermonkey for testing
+
+=== Clone And Install
+[,bash]
+----
+git clone https://github.com/ajw1970/X-Ghosted.git
+cd X-Ghosted
+npm install
+----
+
+=== Build The Userscript
+[,bash]
+----
+npm run build
+----
+
+The build script runs TypeScript (`tsc`) and bundles everything via `build-xGhosted.js`. The generated userscript is written to `src/xGhosted.user.js`. Each build also refreshes shared utilities under `window.XGhostedUtils` for browser injection.
+
+=== Run Tests
+[,bash]
+----
+npm test
+----
+
+Vitest executes the unit suite (with coverage) so you can catch regressions before publishing.
+
+=== Load A Local Build Into Tampermonkey
+1. Run `npm run build` so `src/xGhosted.user.js` is current.
+2. In Tampermonkey, click *Create a new script*.
+3. Replace the placeholder contents with the freshly built file.
+4. Press *Save*, then reload X. Future `npm run build` executions require re-pasting the file (or use Tampermonkey's "File URL" sync if you self-host it).
+
+== Project Layout
+* `src/` – Core application code (panel UI, scanners, managers, utilities).
+* `docs/` – AsciiDoc documentation, including deep dives and troubleshooting.
+* `samples/` – Static HTML captures of real timelines for regression testing.
+* `build-*.sh` / `build-xGhosted.js` – Tooling for bundling and generating the final userscript.
+
+== Support & Community
+Questions or ideas? Open an issue on GitHub or join the link:https://x.com/i/communities/1891057939835666756[Ghostbanned on X Community] to compare notes with other power users. Keep your X account clean with xGhosted!

@@ -47,6 +47,8 @@ export const EVENTS: Events = {
   SET_INITIAL_WAIT_TIME: "xghosted:set-initial-wait-time",
   SET_POST_DENSITY: "xghosted:set-post-density",
   SAVE_METRICS: "xghosted:save-metrics",
+  AUTO_DELETE_TOGGLE_REQUEST: "xghosted:auto-delete-toggle-request",
+  AUTO_DELETE_STATUS: "xghosted:auto-delete-status",
 };
 
 export const EVENT_CONTRACTS: EventContracts = {
@@ -107,4 +109,13 @@ export const EVENT_CONTRACTS: EventContracts = {
   [EVENTS.SET_INITIAL_WAIT_TIME]: { time: "number" },
   [EVENTS.SET_POST_DENSITY]: { count: "number" },
   [EVENTS.SAVE_METRICS]: {},
+  [EVENTS.AUTO_DELETE_TOGGLE_REQUEST]: { enabled: "boolean" },
+  [EVENTS.AUTO_DELETE_STATUS]: {
+    running: "boolean",
+    deleting: "boolean",
+    deletedCount: "number",
+    username: "string|null",
+    canRun: "boolean",
+    message: "string",
+  },
 };
