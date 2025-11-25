@@ -17,12 +17,17 @@ const PROBLEM_MARKERS = [
 ];
 
 const DEFAULT_CONFIG = {
-  WAIT_BETWEEN_STEPS: 400,
-  WAIT_AFTER_DELETE: 500,
-  SCAN_INTERVAL: 4000,
-  MENU_ATTEMPTS: 4,
-  CONFIRM_ATTEMPTS: 4,
+  WAIT_BETWEEN_STEPS: 200,
+  WAIT_AFTER_DELETE: 150,
+  SCAN_INTERVAL: 400,
+  MENU_ATTEMPTS: 3,
+  CONFIRM_ATTEMPTS: 3,
 };
+
+// Global flag used to pause auto-scroll while auto-delete is working
+if (typeof window !== "undefined") {
+  window.__xghostedPauseScroll = false;
+}
 
 export class AutoDeleteManager {
   constructor({
@@ -133,6 +138,10 @@ export class AutoDeleteManager {
     if (!article) {
       return;
     }
+
+    // Pause auto-scroll as soon as we know there's a tweet to delete
+    this.window.__xghostedPauseScroll = true;
+
     this.state.deleting = true;
     this.emitStatus();
     try {
@@ -149,6 +158,9 @@ export class AutoDeleteManager {
     } finally {
       this.state.deleting = false;
       this.emitStatus();
+
+      // Resume auto-scroll after delete finishes (success or fail)
+      this.window.__xghostedPauseScroll = false;
     }
   }
 

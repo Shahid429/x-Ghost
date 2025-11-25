@@ -175,6 +175,12 @@ class PollingManager {
   }
 
   performAutoScroll(cellInnerDivCount, previousPostCount) {
+    // Do nothing while auto-delete is working
+    if (window.__xghostedPauseScroll) {
+      this.log("Auto-scroll paused: auto-delete in progress");
+      return previousPostCount;
+    }
+
     if (
       this.state.isPostScanningEnabled &&
       this.state.userRequestedAutoScrolling

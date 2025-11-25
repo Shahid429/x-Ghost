@@ -335,12 +335,15 @@
       'postquality.potential-problem',
     ];
     var DEFAULT_CONFIG = {
-      WAIT_BETWEEN_STEPS: 400,
-      WAIT_AFTER_DELETE: 500,
-      SCAN_INTERVAL: 4e3,
-      MENU_ATTEMPTS: 4,
-      CONFIRM_ATTEMPTS: 4,
+      WAIT_BETWEEN_STEPS: 200,
+      WAIT_AFTER_DELETE: 150,
+      SCAN_INTERVAL: 400,
+      MENU_ATTEMPTS: 3,
+      CONFIRM_ATTEMPTS: 3,
     };
+    if (typeof window !== 'undefined') {
+      window.__xghostedPauseScroll = false;
+    }
     var AutoDeleteManager = class {
       constructor({
         document: document2,
@@ -442,6 +445,7 @@
         if (!article) {
           return;
         }
+        this.window.__xghostedPauseScroll = true;
         this.state.deleting = true;
         this.emitStatus();
         try {
@@ -460,6 +464,7 @@
         } finally {
           this.state.deleting = false;
           this.emitStatus();
+          this.window.__xghostedPauseScroll = false;
         }
       }
       async deleteArticle(article) {
@@ -1048,6 +1053,10 @@
         return postsProcessed;
       }
       performAutoScroll(cellInnerDivCount, previousPostCount) {
+        if (window.__xghostedPauseScroll) {
+          this.log('Auto-scroll paused: auto-delete in progress');
+          return previousPostCount;
+        }
         if (
           this.state.isPostScanningEnabled &&
           this.state.userRequestedAutoScrolling
